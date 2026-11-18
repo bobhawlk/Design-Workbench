@@ -64,7 +64,9 @@ fn mm(v: f64) -> String {
 }
 
 fn mat16(m: &M4) -> Json {
-    let r = |x: f64| (x * 1e9).round() / 1e9 + 0.0;
+    // Full precision: rounding the rotation would make it shear by the rounding step, and
+    // SolidCraft refuses a placement more than 1e-9 from rigid.
+    let r = |x: f64| if x.abs() < 1e-14 { 0.0 } else { x };
     Json::Arr(m.orthonormalised().to_vec16().into_iter().map(|x| Json::from(r(x))).collect())
 }
 
@@ -110,15 +112,26 @@ pub fn part_steps(a: &Analysis, def: usize, step_path: &str, out_file: &str, opt
         provenance.set("mirror_of", a.model.defs[m.of].name.as_str());
         props.set("Mirror of", a.model.defs[m.of].name.as_str());
     }
-    steps.push(
-        Step::op(
-            "doc_metadata",
-            obj! {"part_number" => d.part_number.clone(), "description" => d.properties.get("Description").cloned(), "material" => d.material.clone(),
-                  "properties" => props, "values" => obj!{"io.github.lcw.bridge" => provenance}},
-            "part properties",
-        )
-        .soft(),
-    );
+    // The design's own keys (part number, description) and everything else under the bridge's
+    // reverse-DNS key: SolidCraft reserves every other unprefixed key.
+    provenance.set("properties", props.clone());
+    let mut values = obj! {"io.github.lcw.bridge" => provenance};
+    if let Some(pn) = d.part_number.clone().filter(|s| !s.trim().is_empty()) {
+        values.set("part_number", pn.as_str());
+    }
+    if let Some(desc) = d.properties.get("Description").filter(|s| !s.trim().is_empty()) {
+        values.set("description", desc.as_str());
+    }
+    steps.push(Step::op("doc_metadata", obj! {"values" => values}, "part properties").soft());
+    // Material and free properties are a component's part properties.
+    let mut cm = obj! {"component" => var("part_component"), "properties" => props};
+    if let Some(pn) = d.part_number.clone().filter(|s| !s.trim().is_empty()) {
+        cm.set("part_number", pn.as_str());
+    }
+    if let Some(m) = d.material.clone().filter(|s| !s.trim().is_empty()) {
+        cm.set("material", m.as_str());
+    }
+    steps.push(Step::op("component_metadata", cm, "part material and properties").soft().needs("part_component"));
     steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {}", d.name)));
     DesignSteps { name: d.name.clone(), file: out_file.to_string(), steps }
 }
@@ -244,7 +257,7 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
         let s: Vec<String> = a.patterns.iter().map(|p| format!("{}: {}", p.name, describe_pattern(&p.found.kind))).collect();
         props.set("Patterns", s.join("; "));
     }
-    steps.push(Step::op("doc_metadata", obj! {"properties" => props}, "assembly properties").soft());
+    steps.push(Step::op("doc_metadata", obj! {"values" => obj!{"io.github.lcw.bridge" => obj!{"properties" => props}}}, "assembly properties").soft());
     steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {name}")));
     DesignSteps { name, file: out_file.to_string(), steps }
 }

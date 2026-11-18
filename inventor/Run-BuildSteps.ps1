@@ -135,6 +135,7 @@ $failed = 0
 foreach ($design in $designs) {
   LogLine "== $($design.name)"
   $stopped = $false
+  $doneCount = 0
   foreach ($step in $design.steps) {
     if ($stopped -and $step.tool -ne 'save') { continue }
     $soft = $step.on_error -eq 'continue'
@@ -154,12 +155,37 @@ foreach ($design in $designs) {
       } catch {
         $err = $_.Exception.Message
         $done = $false
+        # The profile's retry: drop the point an error names from a list parameter and run again
+        # (a bend that closes a loop of bends is cut open instead).
+        $dp = if ($step.op) { $profileJson.ops.($step.op).retry_dropping_point } else { $null }
+        if ($dp) {
+          $a = [ordered]@{}; foreach ($k in $args2.Keys) { $a[$k] = $args2[$k] }
+          $dropped = @()
+          while (-not $done) {
+            $hit = $false; foreach ($w in @($dp.when)) { if ($err -like "*$w*") { $hit = $true } }
+            if (-not $hit) { break }
+            $m = [regex]::Match($err, '\((-?[\d.]+),\s*(-?[\d.]+),\s*(-?[\d.]+)\)')
+            $list = @($a[$dp.param])
+            if (-not $m.Success -or $list.Count -le 1) { break }
+            $px = [double]$m.Groups[1].Value; $py = [double]$m.Groups[2].Value; $pz = [double]$m.Groups[3].Value
+            $best = 0; $bestD = [double]::MaxValue
+            for ($i = 0; $i -lt $list.Count; $i++) {
+              $q = @($list[$i]); $d = [math]::Pow($q[0] - $px, 2) + [math]::Pow($q[1] - $py, 2) + [math]::Pow($q[2] - $pz, 2)
+              if ($d -lt $bestD) { $bestD = $d; $best = $i }
+            }
+            $dropped += "($px, $py, $pz)"
+            $a[$dp.param] = @(for ($i = 0; $i -lt $list.Count; $i++) { if ($i -ne $best) { , $list[$i] } })
+            try { $result = Run-Op $step.op $a; $done = $true; LogLine "   $($step.label): done without the bend at $($dropped -join ', ') (cut open there)" }
+            catch { $err = $_.Exception.Message }
+          }
+        }
         foreach ($alt in @($step.alternatives)) {
           if (-not $alt) { continue }
           try { $result = Run-Op $alt.op (Resolve-Vars $alt.args); $done = $true; LogLine "   $($step.label): used $($alt.op) instead"; break } catch { }
         }
         if (-not $done) { throw $err }
       }
+      $doneCount++
       if ($step.bind) {
         foreach ($p in $step.bind.PSObject.Properties) {
           foreach ($ptr in @($p.Value)) { $v = Pointer $result $ptr; if ($null -ne $v) { $vars[$p.Name] = $v; break } }
@@ -169,12 +195,13 @@ foreach ($design in $designs) {
       $msg = $_.Exception.Message
       if ($msg -like 'needs *') { LogLine "   skipped $($step.label): $msg"; continue }
       LogLine "   FAILED $($step.label): $msg"
-      if (-not $soft) { $stopped = $true; $failed++ }
+      if (-not $soft) { $stopped = $true; $failed++; LogLine "   (stopped here: the rest of this design's steps were not run)" }
     }
   }
+  if ($design.steps.Count -gt 20) { LogLine "   $doneCount of $($design.steps.Count) steps done" }
 }
 try { $stdin.Close() } catch { }
 try { if (-not $proc.WaitForExit(5000)) { $proc.Kill() } } catch { }
+if ($failed) { LogLine "$failed design(s) stopped early; see the messages above" } else { LogLine 'All designs built.' }
 if ($Log) { [IO.File]::WriteAllLines($Log, $logLines) }
-if ($failed) { LogLine "$failed design(s) stopped early; see the messages above"; exit 1 }
-LogLine 'All designs built.'
+if ($failed) { exit 1 }

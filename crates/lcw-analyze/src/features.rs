@@ -223,9 +223,55 @@ pub fn interior_point(face: &Face) -> Option<V3> {
 pub fn round_face_point(face: &Face) -> Option<V3> {
     let Surface::Cylinder { axis, radius } = &face.surface else { return None };
     let ax = Axis { origin: axis.origin, dir: axis.dir.unit()? };
+    // The middle of the longest straight boundary edge running along the axis: where a bend
+    // cylinder meets the flat beside it. It is a line of the tessellation too, so a pick there
+    // is exact; a point in the middle of the arc can lie off a coarse mesh by more than a pick's
+    // tolerance.
+    let mut best: Option<(f64, V3)> = None;
+    for lp in &face.loops {
+        for i in 0..lp.len() {
+            let (a, b) = (lp[i], lp[(i + 1) % lp.len()]);
+            let d = b - a;
+            let len = d.norm();
+            if len < 1e-6 || d.cross(ax.dir).norm() > 1e-4 * len {
+                continue;
+            }
+            if best.is_none_or(|(l, _)| len > l) {
+                best = Some((len, (a + b) * 0.5));
+            }
+        }
+    }
+    if let Some((_, p)) = best {
+        return Some(p);
+    }
     let n = face.vertices.len().max(1) as f64;
     let mean = face.vertices.iter().fold(V3::ZERO, |a, p| a + *p) / n;
     let foot = ax.project(mean);
     let radial = (mean - foot).unit()?;
     Some(foot + radial * *radius)
+}
+
+/// `p` moved to the pickable point of the bend cylinder it lies on (within `tol` of its surface
+/// and its axial extent), or `p` unchanged when it lies on none.
+pub fn snap_to_bend(faces: &[Face], p: V3, tol: f64) -> V3 {
+    for f in faces {
+        let Surface::Cylinder { axis, radius } = &f.surface else { continue };
+        let Some(dir) = axis.dir.unit() else { continue };
+        let ax = Axis { origin: axis.origin, dir };
+        let foot = ax.project(p);
+        if ((p - foot).norm() - radius).abs() > tol {
+            continue;
+        }
+        let t: Vec<f64> = f.vertices.iter().map(|q| (*q - ax.origin).dot(dir)).collect();
+        let tp = (p - ax.origin).dot(dir);
+        let lo = t.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = t.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        if tp < lo - tol || tp > hi + tol {
+            continue;
+        }
+        if let Some(q) = round_face_point(f) {
+            return q;
+        }
+    }
+    p
 }

@@ -5,9 +5,10 @@
   "ops": {
     "insert_step":       {"command": "file.insert_step",           "params": {"path": "path", "name": "name", "names": "names"}},
     "sheet_rule":        {"command": "sheet.manage_rules",         "params": {"name": "name", "thickness": "thickness", "k_factor": "k_factor", "bend_radius": "bend_radius", "active": "active"}},
-    "sheet_convert":     {"command": "sheet.convert",              "params": {"body": "body", "face": "face", "bends": "bends", "rule": "rule"}},
-    "doc_metadata":      {"command": "document.metadata.set",      "params": {"part_number": "part_number", "description": "description", "material": "material", "properties": "properties", "values": "values"}},
-    "component_metadata":{"command": "component.metadata.set",     "params": {"component": "component", "part_number": "part_number", "description": "description", "material": "material", "properties": "properties", "values": "values"}},
+    "sheet_convert":     {"command": "sheet.convert",              "params": {"body": "body", "face": "face", "bends": "bends", "rule": "rule"},
+                          "retry_dropping_point": {"param": "bends", "when": ["closes a loop of bends"]}},
+    "doc_metadata":      {"command": "document.metadata.set",      "params": {"values": "values", "key": "key", "value": "value"}},
+    "component_metadata":{"command": "component.metadata.set",     "params": {"component": "component", "part_number": "part_number", "description": "description", "revision": "revision", "material": "material", "properties": "properties"}},
     "insert_design":     {"command": "component.insert_design",    "params": {"path": "path", "name": "name", "parent": "parent"}},
     "create_component":  {"command": "component.create",           "params": {"name": "name", "parent": "parent", "activate": "activate", "grounded": "grounded"}},
     "copy_occurrence":   {"command": "occurrence.copy",            "params": {"component": "component", "parent": "parent"}},

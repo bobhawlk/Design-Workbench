@@ -102,11 +102,40 @@ impl<'a> Runner<'a> {
         if step.tool == "auto_limits" {
             return self.auto_limits(&args);
         }
-        let first = match &step.op {
+        let mut first = match &step.op {
             Some(op) => self.execute_op(op, &args).map(|(r, _)| r),
             None => self.transport.call(&step.tool, args.clone()),
         };
+        let mut dropped = Vec::new();
+        if let (Err(_), Some(op)) = (&first, &step.op) {
+            if let Some(dp) = self.profile.ops.get(op).and_then(|o| o.drop_point.clone()) {
+                let mut a = args.clone();
+                while let Err(e) = &first {
+                    if !dp.when.iter().any(|w| e.contains(w.as_str())) {
+                        break;
+                    }
+                    let Some(p) = first_point(e) else { break };
+                    let Some(list) = a.get(&dp.param).and_then(Json::as_array).map(<[Json]>::to_vec) else { break };
+                    let dist = |j: &Json| {
+                        let v = j.as_array().unwrap_or(&[]).iter().filter_map(Json::as_f64).collect::<Vec<_>>();
+                        if v.len() == 3 { (0..3).map(|i| (v[i] - p[i]).powi(2)).sum::<f64>() } else { f64::INFINITY }
+                    };
+                    let Some((i, _)) = list.iter().enumerate().map(|(i, j)| (i, dist(j))).min_by(|x, y| x.1.total_cmp(&y.1)) else { break };
+                    if list.len() <= 1 {
+                        break;
+                    }
+                    let mut rest = list;
+                    dropped.push(rest.remove(i).to_compact());
+                    a.set(&dp.param, Json::Arr(rest));
+                    first = self.execute_op(op, &a).map(|(r, _)| r);
+                }
+                if first.is_err() {
+                    dropped.clear();
+                }
+            }
+        }
         let (result, status) = match first {
+            Ok(r) if !dropped.is_empty() => (r, Status::Fallback(format!("without the bend at {} (cut open there)", dropped.join(", ")))),
             Ok(r) => (r, Status::Done),
             Err(e) => {
                 let mut outcome = Err(e);
@@ -220,4 +249,20 @@ mod tests {
         let place = &rec.calls.iter().find(|(_, a)| a.str_of("command") == Some("occurrence.move")).unwrap().1;
         assert_eq!(place.pointer("params/occurrence").and_then(Json::as_f64), Some(1102.0));
     }
+}
+
+/// The first "(x, y, z)" in a message.
+fn first_point(msg: &str) -> Option<[f64; 3]> {
+    let mut rest = msg;
+    while let Some(i) = rest.find('(') {
+        let tail = &rest[i + 1..];
+        if let Some(j) = tail.find(')') {
+            let v: Vec<f64> = tail[..j].split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if v.len() == 3 {
+                return Some([v[0], v[1], v[2]]);
+            }
+        }
+        rest = tail;
+    }
+    None
 }

@@ -200,7 +200,7 @@ fn abs(p: &Path) -> String {
 
 /// Write each part's STEP into `<out>/parts` (copied from the bundle, or cut out of the source
 /// STEP) and return the paths by definition.
-fn write_part_steps(a: &Analysis, out: &Path) -> Result<BTreeMap<usize, PathBuf>, String> {
+fn write_part_steps(a: &Analysis, out: &Path, skipped: &mut Vec<String>) -> Result<BTreeMap<usize, PathBuf>, String> {
     let dir = out.join("parts");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let used: std::collections::BTreeSet<usize> = a.instances.iter().filter(|x| !a.model.defs[x.def].assembly).map(|x| x.def).collect();
@@ -211,6 +211,11 @@ fn write_part_steps(a: &Analysis, out: &Path) -> Result<BTreeMap<usize, PathBuf>
     };
     for d in used {
         let def = &a.model.defs[d];
+        if def.solids.is_empty() {
+            // Surfaces only (a reference sketch, a construction surface): no part to build.
+            skipped.push(def.name.clone());
+            continue;
+        }
         let target = dir.join(format!("{}.stp", def.key));
         if let Some(src) = &def.step {
             std::fs::copy(src, &target).map_err(|e| format!("{}: {e}", src.display()))?;
@@ -228,13 +233,17 @@ fn write_part_steps(a: &Analysis, out: &Path) -> Result<BTreeMap<usize, PathBuf>
 fn convert(a: &Args, input: &Path) -> Result<bool, String> {
     let t0 = std::time::Instant::now();
     let model = load_model(input)?;
-    let analysis = analyze(model, &analysis_options(a));
+    let mut analysis = analyze(model, &analysis_options(a));
     let out = a.out.clone().unwrap_or_else(|| {
         let base = if input.is_dir() { input.to_path_buf() } else { input.parent().map(Path::to_path_buf).unwrap_or_default() };
         base.join("SolidCraft")
     });
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
-    let steps_by_def = write_part_steps(&analysis, &out)?;
+    let mut skipped = Vec::new();
+    let steps_by_def = write_part_steps(&analysis, &out, &mut skipped)?;
+    for name in &skipped {
+        analysis.notes.push(format!("{name} has no solid bodies (surfaces only) and is left out"));
+    }
     let target = |p: &Path| -> String {
         let s = abs(p);
         match &a.path_map {

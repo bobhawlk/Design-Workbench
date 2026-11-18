@@ -17,6 +17,16 @@ pub struct Op {
     pub command: String,
     /// inv2sc's parameter name → SolidCraft's.
     pub params: BTreeMap<String, String>,
+    /// Retry after an error that names a point: drop the nearest point from a list parameter
+    /// (inv2sc's name) and run again, when the error contains `when`. For example a bend that
+    /// closes a loop of bends: leaving it out cuts the sheet open there.
+    pub drop_point: Option<DropPoint>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DropPoint {
+    pub param: String,
+    pub when: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +57,10 @@ impl Profile {
                 .and_then(Json::as_object)
                 .map(|ps| ps.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
                 .unwrap_or_default();
-            ops.insert(name.clone(), Op { command, params });
+            let drop_point = o.get("retry_dropping_point").and_then(|r| {
+                Some(DropPoint { param: r.str_of("param")?.to_string(), when: r.arr_of("when").iter().filter_map(|x| x.as_str().map(str::to_string)).collect() })
+            });
+            ops.insert(name.clone(), Op { command, params, drop_point });
         }
         let fallbacks = j
             .get("fallbacks")

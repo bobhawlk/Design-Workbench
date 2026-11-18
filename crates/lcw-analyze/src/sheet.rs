@@ -96,7 +96,11 @@ pub fn plan(solids: &[Solid], inventor: Option<&SheetMetal>, material: Option<&s
                     None => return None,
                 },
             };
-            let bends = if !sm.bend_points.is_empty() { sm.bend_points.clone() } else { geo.as_ref().map(|g| g.bends.clone()).unwrap_or_default() };
+            let bends = if !sm.bend_points.is_empty() {
+                // Inventor's points are anywhere on a bend face; move each to its tangent edge.
+                let faces: &[_] = solids.first().map(|s| s.faces.as_slice()).unwrap_or(&[]);
+                sm.bend_points.iter().map(|p| crate::features::snap_to_bend(faces, *p, (t * 0.05).max(0.01))).collect()
+            } else { geo.as_ref().map(|g| g.bends.clone()).unwrap_or_default() };
             Some(SheetPlan {
                 thickness: t,
                 bend_radius: r,
