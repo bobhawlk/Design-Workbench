@@ -1,0 +1,494 @@
+//! From the analysis to build steps: one SolidCraft design per part (linked into the assembly,
+//! so a part used many times is one file), then the assembly with its sub-assemblies as nested
+//! components, its placements, grounding, joints, constraints and patterns.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use lcw_analyze::joints::{ConstraintPlan, JointPlan, Kind, Pick};
+use lcw_analyze::patterns::Kind as PatKind;
+use lcw_analyze::sheet::SheetPlan;
+use lcw_analyze::Analysis;
+use lcw_geom::{M4, V3};
+use lcw_json::{obj, Json};
+
+use crate::steps::{var, DesignSteps, Step};
+
+pub struct Options {
+    /// Folder the designs are written to (absolute, as SolidCraft will see it).
+    pub out_dir: String,
+    /// Path separator of the machine SolidCraft runs on.
+    pub sep: char,
+    /// Make sheet metal parts sheet metal.
+    pub sheet_metal: bool,
+    /// Set revolute and slider limits from where the parts meet (`joint.find_limits`).
+    pub find_limits: bool,
+    /// Make patterns' spacing a parameter (linear and grid patterns).
+    pub parametric_patterns: bool,
+    /// The name of the assembly design.
+    pub assembly_name: Option<String>,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options { out_dir: ".".into(), sep: std::path::MAIN_SEPARATOR, sheet_metal: true, find_limits: true, parametric_patterns: true, assembly_name: None }
+    }
+}
+
+/// Everything to build, in order: parts first, then the assembly.
+pub struct BuildPlan {
+    pub parts: Vec<DesignSteps>,
+    pub assembly: DesignSteps,
+    /// For each part design: the definition it builds.
+    pub part_defs: Vec<usize>,
+}
+
+impl BuildPlan {
+    pub fn to_json(&self) -> Json {
+        let design = |d: &DesignSteps| obj! {"name" => &d.name, "file" => &d.file, "steps" => Json::Arr(d.steps.iter().map(Step::to_json).collect())};
+        obj! {
+            "schema" => "lcw-build-steps/1",
+            "parts" => Json::Arr(self.parts.iter().map(design).collect()),
+            "assembly" => design(&self.assembly),
+        }
+    }
+}
+
+fn v3j(p: V3) -> Json {
+    let r = |x: f64| (x * 1e6).round() / 1e6 + 0.0;
+    Json::from([r(p.x), r(p.y), r(p.z)])
+}
+
+fn mm(v: f64) -> String {
+    let s = format!("{v:.4}");
+    format!("{} mm", s.trim_end_matches('0').trim_end_matches('.'))
+}
+
+fn mat16(m: &M4) -> Json {
+    let r = |x: f64| (x * 1e9).round() / 1e9 + 0.0;
+    Json::Arr(m.orthonormalised().to_vec16().into_iter().map(|x| Json::from(r(x))).collect())
+}
+
+/// A parameter name from free text: letters, digits and underscores, not starting with a digit.
+pub fn param_name(s: &str) -> String {
+    let mut out: String = s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    while out.contains("__") {
+        out = out.replace("__", "_");
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.chars().next().is_none_or(|c| c.is_ascii_digit()) {
+        format!("p_{out}")
+    } else {
+        out
+    }
+}
+
+/// The steps that build one part's design from its STEP.
+pub fn part_steps(a: &Analysis, def: usize, step_path: &str, out_file: &str, opts: &Options) -> DesignSteps {
+    let d = &a.model.defs[def];
+    let mut steps = vec![Step::tool("new_design", Json::obj(), format!("new design for {}", d.name))];
+    steps.push(
+        Step::op("insert_step", obj! {"path" => step_path, "name" => d.key.as_str(), "names" => "solid"}, format!("import {}", d.name))
+            .bind("part_component", &["/component"])
+            .bind("body", &["/created_bodies/0", "/bodies/0/name", "/bodies/0"]),
+    );
+    steps.push(Step::op("list_bodies", obj! {"names_only" => true}, "read the body name").soft().bind("body", &["/bodies/0/name", "/bodies/0/definition", "/bodies/0"]));
+    if opts.sheet_metal {
+        if let Some(sp) = a.sheets.get(&def) {
+            steps.extend(sheet_steps(sp, &d.name));
+        }
+    }
+    let mut props = Json::obj();
+    for (k, v) in &d.properties {
+        props.set(k, v.as_str());
+    }
+    props.set("Source file", a.model.source_file.as_str());
+    let mut provenance = obj! {"bridge" => concat!("inv2sc ", env!("CARGO_PKG_VERSION")), "source_app" => a.model.source_app.as_str(), "definition" => d.name.as_str()};
+    if let Some(doc) = &d.doc {
+        provenance.set("inventor_document", doc.as_str());
+    }
+    if let Some(m) = a.mirrors.iter().find(|m| m.part == def) {
+        provenance.set("mirror_of", a.model.defs[m.of].name.as_str());
+        props.set("Mirror of", a.model.defs[m.of].name.as_str());
+    }
+    steps.push(
+        Step::op(
+            "doc_metadata",
+            obj! {"part_number" => d.part_number.clone(), "description" => d.properties.get("Description").cloned(), "material" => d.material.clone(),
+                  "properties" => props, "values" => obj!{"io.github.lcw.bridge" => provenance}},
+            "part properties",
+        )
+        .soft(),
+    );
+    steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {}", d.name)));
+    DesignSteps { name: d.name.clone(), file: out_file.to_string(), steps }
+}
+
+fn sheet_steps(sp: &SheetPlan, name: &str) -> Vec<Step> {
+    let rule = obj! {"name" => sp.rule.as_str(), "thickness" => mm(sp.thickness), "k_factor" => sp.k_factor, "bend_radius" => mm(sp.bend_radius), "active" => true};
+    let bends: Vec<Json> = sp.bends.iter().map(|b| v3j(*b)).collect();
+    let mut convert = obj! {"body" => var("body"), "face" => v3j(sp.base_point), "rule" => sp.rule.as_str()};
+    if !bends.is_empty() {
+        convert.set("bends", Json::Arr(bends));
+    }
+    vec![
+        Step::op("sheet_rule", rule, format!("sheet metal rule {}", sp.rule)).soft(),
+        Step::op("sheet_convert", convert, format!("make {name} sheet metal")).soft().needs("body").bind("sheet", &["/name", "/id"]),
+    ]
+}
+
+/// The occurrence vars of every instance (and its full path), filled while placing.
+#[derive(Default)]
+struct Placed {
+    /// instance path → the var naming its occurrence.
+    occ: BTreeMap<Vec<usize>, String>,
+    /// assembly definition → the var of its component (made once).
+    asm_component: BTreeMap<usize, String>,
+    /// part definition → the var of its linked component (inserted once).
+    part_component: BTreeMap<usize, String>,
+    /// assembly definition → the path its children were first created under.
+    first_path: BTreeMap<usize, Vec<usize>>,
+    /// Instance paths under an assembly placed more than once (they need `path` in joints).
+    repeated: BTreeSet<Vec<usize>>,
+    first_part: Option<Vec<usize>>,
+}
+
+fn key(path: &[usize]) -> String {
+    path.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(".")
+}
+
+/// The assembly's steps. `part_files[def]` is the .sc each part design was saved as.
+pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_file: &str, opts: &Options) -> DesignSteps {
+    let m = &a.model;
+    let root = &m.defs[m.root];
+    let name = opts.assembly_name.clone().unwrap_or_else(|| root.name.clone());
+    let mut steps = vec![Step::tool("new_design", Json::obj(), format!("new design for {name}"))];
+    let mut placed = Placed::default();
+    place_children(a, m.root, &[], None, part_files, &mut placed, &mut steps, opts);
+    // Patterns: one parameter per spacing.
+    if opts.parametric_patterns {
+        for p in &a.patterns {
+            steps.extend(pattern_steps(a, p, &placed));
+        }
+    }
+    // Grounding: the planned ground, and the first part SolidCraft grounds by itself released.
+    let ground: BTreeSet<Vec<usize>> = a.joints.ground.iter().cloned().collect();
+    if let Some(first) = &placed.first_part {
+        if !ground.contains(first) {
+            if let Some(v) = placed.occ.get(first) {
+                steps.push(Step::op("ground", obj! {"occurrence" => var(v), "grounded" => false}, "release the automatic ground").soft());
+            }
+        }
+    }
+    for g in &ground {
+        if let Some(v) = placed.occ.get(g) {
+            steps.push(Step::op("ground", obj! {"occurrence" => var(v), "grounded" => true}, format!("ground {}", inst_name(a, g))).soft());
+        }
+    }
+    // Sub-assembly containers stay with the ground (their children move by their own joints).
+    let anchor = a.joints.ground.first().cloned();
+    let containers: Vec<Vec<usize>> = a.instances.iter().filter(|x| m.defs[x.def].assembly).map(|x| x.path.clone()).collect();
+    // Rigid groups.
+    let mut groups = a.joints.rigid_groups.clone();
+    if let Some(anchor) = &anchor {
+        if !containers.is_empty() {
+            let mut g = vec![anchor.clone()];
+            g.extend(containers.iter().cloned());
+            groups.push(g);
+        }
+    }
+    for g in &groups {
+        let addressable = g.iter().all(|p| !placed.repeated.contains(p) && placed.occ.contains_key(p));
+        if addressable && g.len() >= 2 {
+            let list: Vec<Json> = g.iter().filter_map(|p| placed.occ.get(p)).map(|v| var(v)).collect();
+            steps.push(Step::op("rigid_group", obj! {"occurrences" => Json::Arr(list)}, format!("hold {} part(s) to {}", g.len() - 1, inst_name(a, &g[0]))).soft());
+        } else {
+            for p in &g[1..] {
+                let origin = a.instances.iter().find(|x| &x.path == p).map_or(V3::ZERO, |x| x.world.origin());
+                let j = JointPlan {
+                    name: format!("{} held", inst_name(a, p)),
+                    kind: Kind::Rigid,
+                    a: g[0].clone(),
+                    b: p.clone(),
+                    origin,
+                    z: V3::Z,
+                    x: Some(V3::X),
+                    limits: Vec::new(),
+                    source: lcw_analyze::joints::Source::Inferred("rigid group".into()),
+                };
+                steps.push(joint_step(a, &placed, &j, false));
+            }
+        }
+    }
+    // Joints and constraints.
+    for j in &a.joints.joints {
+        steps.push(joint_step(a, &placed, j, opts.find_limits));
+        if opts.find_limits && j.limits.is_empty() && matches!(j.kind, Kind::Revolute | Kind::Slider) {
+            steps.push(
+                Step::op("find_limits", obj! {"joint" => j.name.as_str()}, format!("find how far {} can move", j.name))
+                    .soft()
+                    .bind(format!("limits:{}", j.name), &["/values/0"]),
+            );
+            steps.push(Step::tool("auto_limits", obj! {"joint" => j.name.as_str(), "found" => var(&format!("limits:{}", j.name))}, format!("limit {}", j.name)).soft().needs(format!("limits:{}", j.name)));
+        }
+    }
+    for c in &a.joints.constraints {
+        steps.push(constraint_step(a, &placed, c));
+    }
+    // What the analysis found, on the design itself.
+    let mut props = obj! {"Source file" => m.source_file.as_str(), "Converted by" => concat!("inv2sc ", env!("CARGO_PKG_VERSION"))};
+    if !a.symmetry.is_empty() {
+        let s: Vec<String> = a.symmetry.iter().map(|p| format!("point {} normal {} ({} pairs)", fmt_v(p.point), fmt_v(p.normal), p.pairs.len())).collect();
+        props.set("Symmetry planes", s.join("; "));
+    }
+    if !a.patterns.is_empty() {
+        let s: Vec<String> = a.patterns.iter().map(|p| format!("{}: {}", p.name, describe_pattern(&p.found.kind))).collect();
+        props.set("Patterns", s.join("; "));
+    }
+    steps.push(Step::op("doc_metadata", obj! {"properties" => props}, "assembly properties").soft());
+    steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {name}")));
+    DesignSteps { name, file: out_file.to_string(), steps }
+}
+
+fn fmt_v(v: V3) -> String {
+    format!("({:.2}, {:.2}, {:.2})", v.x, v.y, v.z)
+}
+
+pub fn describe_pattern(k: &PatKind) -> String {
+    match k {
+        PatKind::Linear { dir, spacing, count } => format!("{count} in a row, {spacing:.3} mm apart along {}", fmt_v(*dir)),
+        PatKind::Rectangular { spacing1, count1, spacing2, count2, .. } => format!("{count1} x {count2} grid, {spacing1:.3} x {spacing2:.3} mm"),
+        PatKind::Circular { axis, step, count } => format!("{count} round {} every {:.3}°", fmt_v(axis.dir), step.to_degrees()),
+    }
+}
+
+fn inst_name(a: &Analysis, path: &[usize]) -> String {
+    a.model.path_ids(path).last().cloned().unwrap_or_else(|| "?".into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn place_children(a: &Analysis, def: usize, prefix: &[usize], parent_var: Option<&str>, part_files: &BTreeMap<usize, String>, placed: &mut Placed, steps: &mut Vec<Step>, opts: &Options) {
+    let m = &a.model;
+    let repeated_here = prefix.iter().enumerate().any(|(i, _)| placed.repeated.contains(&prefix[..=i].to_vec()));
+    for (i, o) in m.defs[def].occurrences.iter().enumerate() {
+        if o.suppressed {
+            continue;
+        }
+        let mut path = prefix.to_vec();
+        path.push(i);
+        let vname = format!("occ:{}", key(&path));
+        let child = &m.defs[o.def];
+        let parent = parent_var.map(var).unwrap_or(Json::Null);
+        if child.assembly {
+            match placed.asm_component.get(&o.def).cloned() {
+                None => {
+                    let cvar = format!("comp:{}", child.key);
+                    steps.push(
+                        Step::op("create_component", obj! {"name" => child.key.as_str(), "parent" => parent.clone(), "activate" => false, "grounded" => false}, format!("sub-assembly {}", child.name))
+                            .bind(&cvar, &["/component"])
+                            .bind(&vname, &["/occurrence"]),
+                    );
+                    placed.asm_component.insert(o.def, cvar.clone());
+                    placed.first_path.insert(o.def, path.clone());
+                    placed.occ.insert(path.clone(), vname.clone());
+                    steps.push(place_step(&vname, &o.transform, &o.id));
+                    place_children(a, o.def, &path, Some(&cvar), part_files, placed, steps, opts);
+                }
+                Some(cvar) => {
+                    steps.push(Step::op("copy_occurrence", obj! {"component" => var(&cvar), "parent" => parent.clone()}, format!("another {}", child.name)).bind(&vname, &["/occurrence"]));
+                    placed.occ.insert(path.clone(), vname.clone());
+                    steps.push(place_step(&vname, &o.transform, &o.id));
+                    // Its contents are the first copy's; map their paths onto the first copy's vars.
+                    let first = placed.first_path.get(&o.def).cloned().unwrap_or_default();
+                    let under: Vec<(Vec<usize>, String)> = placed.occ.iter().filter(|(p, _)| p.len() > first.len() && p.starts_with(&first)).map(|(p, v)| (p.clone(), v.clone())).collect();
+                    for (p, v) in under {
+                        let mut q = path.clone();
+                        q.extend_from_slice(&p[first.len()..]);
+                        placed.repeated.insert(q.clone());
+                        placed.occ.insert(q, v);
+                    }
+                    placed.repeated.insert(path.clone());
+                    for p in placed.occ.keys().filter(|p| p.starts_with(&first) && p.len() > first.len()).cloned().collect::<Vec<_>>() {
+                        placed.repeated.insert(p);
+                    }
+                }
+            }
+        } else {
+            let Some(file) = part_files.get(&o.def) else { continue };
+            match placed.part_component.get(&o.def).cloned() {
+                None => {
+                    let cvar = format!("part:{}", child.key);
+                    steps.push(
+                        Step::op("insert_design", obj! {"path" => file.as_str(), "name" => child.key.as_str(), "parent" => parent.clone()}, format!("place {}", child.name))
+                            .bind(&cvar, &["/component"])
+                            .bind(&vname, &["/occurrence"]),
+                    );
+                    placed.part_component.insert(o.def, cvar);
+                    if placed.first_part.is_none() && prefix.is_empty() {
+                        placed.first_part = Some(path.clone());
+                    }
+                }
+                Some(cvar) => {
+                    steps.push(Step::op("copy_occurrence", obj! {"component" => var(&cvar), "parent" => parent.clone()}, format!("another {}", child.name)).bind(&vname, &["/occurrence"]));
+                }
+            }
+            placed.occ.insert(path.clone(), vname.clone());
+            steps.push(place_step(&vname, &o.transform, &o.id));
+        }
+        if repeated_here {
+            placed.repeated.insert(path);
+        }
+    }
+}
+
+fn place_step(vname: &str, t: &M4, id: &str) -> Step {
+    Step::op("place", obj! {"occurrence" => var(vname), "to_matrix" => mat16(t), "space" => "local", "move_grounded" => true}, format!("place {id}"))
+}
+
+/// A joint origin on one side.
+fn origin(a: &Analysis, placed: &Placed, path: &[usize], point: V3, z: V3, x: V3) -> Json {
+    let mut o = obj! {"occurrence" => placed.occ.get(path).map(|v| var(v)).unwrap_or(Json::Null), "point" => v3j(point), "z" => v3j(z), "x" => v3j(x)};
+    if placed.repeated.contains(path) {
+        let mut full = Vec::new();
+        for i in 1..=path.len() {
+            if let Some(v) = placed.occ.get(&path[..i]) {
+                full.push(var(v));
+            }
+        }
+        o.set("path", Json::Arr(full));
+    }
+    let _ = a;
+    o
+}
+
+fn joint_step(a: &Analysis, placed: &Placed, j: &JointPlan, _limits_later: bool) -> Step {
+    let z = j.z.unit().unwrap_or(V3::Z);
+    let x = j.x.and_then(|x| (x - z * x.dot(z)).unit()).unwrap_or_else(|| z.any_perp());
+    let mut p = obj! {
+        "type" => j.kind.name(),
+        "a" => origin(a, placed, &j.a, j.origin, z, x),
+        "b" => origin(a, placed, &j.b, j.origin, z, x),
+        "flip" => true,
+        "name" => j.name.as_str(),
+        "quiet" => true,
+    };
+    if !j.limits.is_empty() {
+        p.set("limits", Json::Arr(j.limits.iter().map(|l| Json::from(*l)).collect()));
+    }
+    let why = match &j.source {
+        lcw_analyze::joints::Source::InventorJoint => "Inventor joint".to_string(),
+        lcw_analyze::joints::Source::InventorConstraint => "Inventor constraint".to_string(),
+        lcw_analyze::joints::Source::Inferred(r) => format!("inferred: {r}"),
+    };
+    Step::op("joint", p, format!("{} {} ({why})", j.kind.name(), j.name)).soft()
+}
+
+fn pick_origin(placed: &Placed, path: &[usize], pick: &Pick) -> Json {
+    let occ = placed.occ.get(path).map(|v| var(v)).unwrap_or(Json::Null);
+    let mut o = match pick {
+        Pick::Face(p) => obj! {"occurrence" => occ, "face" => v3j(*p)},
+        Pick::Circle(p) => obj! {"occurrence" => occ, "circle" => v3j(*p)},
+        Pick::Frame { point, z } => obj! {"occurrence" => occ, "point" => v3j(*point), "z" => v3j(*z)},
+    };
+    if placed.repeated.contains(path) {
+        let full: Vec<Json> = (1..=path.len()).filter_map(|i| placed.occ.get(&path[..i]).map(|v| var(v))).collect();
+        o.set("path", Json::Arr(full));
+    }
+    o
+}
+
+fn constraint_step(a: &Analysis, placed: &Placed, c: &ConstraintPlan) -> Step {
+    let mut p = obj! {
+        "type" => c.rule.as_str(),
+        "a" => pick_origin(placed, &c.a.path, &c.a.pick),
+        "b" => pick_origin(placed, &c.b.path, &c.b.pick),
+        "name" => c.name.as_str(),
+        "quiet" => true,
+    };
+    if let Some(o) = c.offset {
+        p.set("offset", o);
+    }
+    if let Some(g) = c.angle_deg {
+        p.set("angle", format!("{g} deg"));
+    }
+    if c.flip {
+        p.set("flip", true);
+    }
+    // Without the constraint command: the joint the rule stands for, where the parts are.
+    let kind = match c.rule.as_str() {
+        "insert" => Some("revolute"),
+        "concentric" => Some("cylindrical"),
+        "mate" | "flush" | "distance" => Some("planar"),
+        _ => None,
+    };
+    let mut step = Step::op("constraint", p, format!("{} {} (Inventor constraint)", c.rule, c.name)).soft();
+    if let Some(kind) = kind {
+        let (pt, z) = match &c.b.pick {
+            Pick::Face(p) | Pick::Circle(p) => (*p, V3::Z),
+            Pick::Frame { point, z } => (*point, *z),
+        };
+        let x = z.any_perp();
+        step = step.or_else(
+            "joint",
+            obj! {"type" => kind, "a" => origin(a, placed, &c.a.path, pt, z, x), "b" => origin(a, placed, &c.b.path, pt, z, x), "flip" => true, "name" => c.name.as_str(), "quiet" => true},
+        );
+    }
+    step
+}
+
+fn pattern_steps(a: &Analysis, p: &lcw_analyze::PatternPlan, placed: &Placed) -> Vec<Step> {
+    // Members are occurrence indices of the pattern's assembly; find their instance paths.
+    let prefixes: Vec<Vec<usize>> = if p.assembly == a.model.root {
+        vec![Vec::new()]
+    } else {
+        a.instances.iter().filter(|x| x.def == p.assembly).map(|x| x.path.clone()).take(1).collect()
+    };
+    let Some(prefix) = prefixes.into_iter().next() else { return Vec::new() };
+    let defs = &a.model.defs[p.assembly];
+    let mut steps = Vec::new();
+    let (params, dirs): (Vec<(String, f64)>, Vec<V3>) = match &p.found.kind {
+        PatKind::Linear { dir, spacing, .. } => (vec![(param_name(&format!("{} spacing", p.name)), *spacing)], vec![*dir]),
+        PatKind::Rectangular { dir1, spacing1, dir2, spacing2, .. } => {
+            (vec![(param_name(&format!("{} spacing 1", p.name)), *spacing1), (param_name(&format!("{} spacing 2", p.name)), *spacing2)], vec![*dir1, *dir2])
+        }
+        PatKind::Circular { .. } => return Vec::new(),
+    };
+    for (n, v) in &params {
+        steps.push(Step::op("parameter", obj! {"name" => n.as_str(), "expression" => mm(*v), "comment" => format!("{}: {}", p.name, describe_pattern(&p.found.kind))}, format!("parameter {n}")).soft().bind(format!("param:{n}"), &["/name", "/changed"]));
+    }
+    let seed = p.found.members[0];
+    let seed_t = defs.occurrences[seed].transform;
+    for (k, &mi) in p.found.members.iter().enumerate().skip(1) {
+        let idx = &p.found.index[k];
+        let mut path = prefix.clone();
+        path.push(mi);
+        let Some(v) = placed.occ.get(&path) else { continue };
+        let expr = |axis: usize| -> Json {
+            let mut terms = Vec::new();
+            for (d, (dir, (n, _))) in dirs.iter().zip(&params).enumerate() {
+                let comp = [dir.x, dir.y, dir.z][axis];
+                let count = idx.get(d).copied().unwrap_or(0) as f64;
+                if comp.abs() > 1e-9 && count != 0.0 {
+                    terms.push(format!("{} * {}", fmt_num(comp * count), n));
+                }
+            }
+            if terms.is_empty() {
+                Json::from(0)
+            } else {
+                Json::Str(terms.join(" + "))
+            }
+        };
+        let final_t = defs.occurrences[mi].transform;
+        steps.push(Step::op("place", obj! {"occurrence" => var(v), "to_matrix" => mat16(&seed_t), "space" => "local", "move_grounded" => true}, format!("pattern seed position for {}", defs.occurrences[mi].id)).soft());
+        steps.push(
+            Step::op("place", obj! {"occurrence" => var(v), "translate" => Json::Arr(vec![expr(0), expr(1), expr(2)]), "space" => "local", "move_grounded" => true}, format!("pattern member {} follows the spacing", defs.occurrences[mi].id))
+                .soft()
+                .or_else("place", obj! {"occurrence" => var(v), "to_matrix" => mat16(&final_t), "space" => "local", "move_grounded" => true}),
+        );
+    }
+    steps
+}
+
+fn fmt_num(v: f64) -> String {
+    let s = format!("{v:.9}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}

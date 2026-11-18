@@ -1,0 +1,33 @@
+{
+  "schema": "lcw-solidcraft-profile/1",
+  "about": "How inv2sc's operations map onto SolidCraft commands. Written against SolidCraft 0.44 (main, November 2026). When a SolidCraft update renames a command or a parameter, change it here (or pass --profile with a copy): `inv2sc probe` checks every entry against the running SolidCraft and says which ones no longer fit.",
+  "tested_with": ["0.44.1"],
+  "ops": {
+    "insert_step":       {"command": "file.insert_step",           "params": {"path": "path", "name": "name", "names": "names"}},
+    "sheet_rule":        {"command": "sheet.manage_rules",         "params": {"name": "name", "thickness": "thickness", "k_factor": "k_factor", "bend_radius": "bend_radius", "active": "active"}},
+    "sheet_convert":     {"command": "sheet.convert",              "params": {"body": "body", "face": "face", "bends": "bends", "rule": "rule"}},
+    "doc_metadata":      {"command": "document.metadata.set",      "params": {"part_number": "part_number", "description": "description", "material": "material", "properties": "properties", "values": "values"}},
+    "component_metadata":{"command": "component.metadata.set",     "params": {"component": "component", "part_number": "part_number", "description": "description", "material": "material", "properties": "properties", "values": "values"}},
+    "insert_design":     {"command": "component.insert_design",    "params": {"path": "path", "name": "name", "parent": "parent"}},
+    "create_component":  {"command": "component.create",           "params": {"name": "name", "parent": "parent", "activate": "activate", "grounded": "grounded"}},
+    "copy_occurrence":   {"command": "occurrence.copy",            "params": {"component": "component", "parent": "parent"}},
+    "place":             {"command": "occurrence.move",            "params": {"occurrence": "occurrence", "to_matrix": "to_matrix", "move_grounded": "move_grounded", "translate": "translate", "space": "space"}},
+    "ground":            {"command": "occurrence.ground",          "params": {"occurrence": "occurrence", "grounded": "grounded"}},
+    "rigid_group":       {"command": "joint.rigid_group",          "params": {"occurrences": "occurrences"}},
+    "joint":             {"command": "joint.create",               "params": {"type": "type", "a": "a", "b": "b", "flip": "flip", "name": "name", "limits": "limits", "quiet": "quiet"}},
+    "constraint":        {"command": "assembly.constraint.create", "params": {"type": "type", "a": "a", "b": "b", "offset": "offset", "angle": "angle", "flip": "flip", "name": "name", "quiet": "quiet"}},
+    "find_limits":       {"command": "joint.find_limits",          "params": {"joint": "joint"}},
+    "set_limits":        {"command": "joint.limits",               "params": {"joint": "joint", "index": "index", "min": "min", "max": "max"}},
+    "parameter":         {"command": "parameters.change",          "params": {"name": "name", "expression": "expression", "comment": "comment"}},
+    "list_bodies":       {"command": "inspect.measure",            "params": {"names_only": "names_only"}}
+  },
+  "origin_forms": {
+    "frame": {"point": "point", "z": "z", "x": "x", "occurrence": "occurrence", "path": "path"},
+    "face": "face",
+    "circle": "circle"
+  },
+  "fallbacks": {
+    "constraint": ["joint"],
+    "rigid_group": ["joint"]
+  }
+}

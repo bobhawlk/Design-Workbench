@@ -1,0 +1,14 @@
+[package]
+name = "lcw-analyze"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lcw-json = { path = "../lcw-json" }
+lcw-geom = { path = "../lcw-geom" }
+lcw-step = { path = "../lcw-step" }
+lcw-bundle = { path = "../lcw-bundle" }
+
+[lints]
+workspace = true

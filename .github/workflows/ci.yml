@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo test --all
+      - run: cargo build --release
+      - name: Analyse the test assemblies
+        run: |
+          ./target/release/inv2sc convert crates/lcw-analyze/tests/bracket_rack.stp --out /tmp/rack --dry-run
+          cat /tmp/rack/conversion-report.md
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all
+      - run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\inv2sc.exe dist\
+          Copy-Item inventor\* dist\
+          Copy-Item profiles\solidcraft.json dist\
+          Copy-Item README.md dist\
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inv2sc-windows
+          path: dist

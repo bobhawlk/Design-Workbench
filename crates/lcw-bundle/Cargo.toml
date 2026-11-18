@@ -1,0 +1,12 @@
+[package]
+name = "lcw-bundle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lcw-json = { path = "../lcw-json" }
+lcw-geom = { path = "../lcw-geom" }
+
+[lints]
+workspace = true
