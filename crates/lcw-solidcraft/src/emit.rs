@@ -8,7 +8,7 @@ use lcw_analyze::joints::{ConstraintPlan, JointPlan, Kind, Pick};
 use lcw_analyze::patterns::Kind as PatKind;
 use lcw_analyze::sheet::SheetPlan;
 use lcw_analyze::Analysis;
-use lcw_geom::{M4, V3};
+use lcw_geom::{Bbox, M4, V3};
 use lcw_json::{obj, Json};
 
 use crate::steps::{var, DesignSteps, Step};
@@ -133,7 +133,7 @@ pub fn part_steps(a: &Analysis, def: usize, step_path: &str, out_file: &str, opt
     }
     steps.push(Step::op("component_metadata", cm, "part material and properties").soft().needs("part_component"));
     steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {}", d.name)));
-    DesignSteps { name: d.name.clone(), file: out_file.to_string(), steps }
+    DesignSteps { name: d.name.clone(), file: out_file.to_string(), steps, notes: Vec::new() }
 }
 
 fn sheet_steps(sp: &SheetPlan, name: &str) -> Vec<Step> {
@@ -162,6 +162,8 @@ struct Placed {
     first_path: BTreeMap<usize, Vec<usize>>,
     /// Instance paths under an assembly placed more than once (they need `path` in joints).
     repeated: BTreeSet<Vec<usize>>,
+    /// Paths of sub-assemblies placed as copies of an earlier placement.
+    copies: BTreeSet<Vec<usize>>,
     first_part: Option<Vec<usize>>,
 }
 
@@ -233,15 +235,53 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
         }
     }
     // Joints and constraints.
+    // Joint names are unique: SolidCraft finds a joint by name, and a part placed several times
+    // gives several pivots of one name.
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    let total: BTreeMap<&str, usize> = a.joints.joints.iter().fold(BTreeMap::new(), |mut m, j| {
+        *m.entry(j.name.as_str()).or_insert(0) += 1;
+        m
+    });
+    let boxes = world_boxes(a);
+    let mut notes = Vec::new();
     for j in &a.joints.joints {
-        steps.push(joint_step(a, &placed, j, opts.find_limits));
+        // Both parts inside one copy of a repeated sub-assembly: SolidCraft anchors both sides on
+        // that copy, so the joint can't be made there (the first placement's joint is).
+        let common = j.a.iter().zip(&j.b).take_while(|(x, y)| x == y).count();
+        if (1..=common).any(|n| placed.copies.contains(&j.a[..n])) {
+            notes.push(format!("{}: not made in the repeated sub-assembly's copy (SolidCraft can't joint two parts inside a copy); the first placement has it", j.name));
+            continue;
+        }
+        let k = seen.entry(j.name.as_str()).or_insert(0);
+        *k += 1;
+        let name = if total[j.name.as_str()] > 1 { format!("{} {}", j.name, k) } else { j.name.clone() };
+        let mut jj = j.clone();
+        jj.name = name.clone();
+        steps.push(joint_step(a, &placed, &jj, opts.find_limits));
         if opts.find_limits && j.limits.is_empty() && matches!(j.kind, Kind::Revolute | Kind::Slider) {
-            steps.push(
-                Step::op("find_limits", obj! {"joint" => j.name.as_str()}, format!("find how far {} can move", j.name))
-                    .soft()
-                    .bind(format!("limits:{}", j.name), &["/values/0"]),
-            );
-            steps.push(Step::tool("auto_limits", obj! {"joint" => j.name.as_str(), "found" => var(&format!("limits:{}", j.name))}, format!("limit {}", j.name)).soft().needs(format!("limits:{}", j.name)));
+            // Check the moving part only against the parts near it: a contact sweep of the whole
+            // assembly is more bodies than SolidCraft sweeps at once.
+            let mut args = obj! {"joint" => name.as_str()};
+            let occ_of = |path: &[usize]| (1..=path.len()).rev().find_map(|i| placed.occ.get(&path[..i]).map(|v| var(v)));
+            if let (Some(mover), Some(bb)) = (occ_of(&j.b), boxes.get(&j.b)) {
+                let near: Vec<Json> = boxes
+                    .iter()
+                    .filter(|(p, b)| **p != j.b && overlaps(bb, b, 2.0))
+                    .filter_map(|(p, _)| occ_of(p))
+                    .filter(|o| *o != mover)
+                    .fold(Vec::new(), |mut v, o| {
+                        if !v.contains(&o) {
+                            v.push(o);
+                        }
+                        v
+                    });
+                if !near.is_empty() && near.len() < 60 {
+                    args.set("occurrences", Json::Arr(vec![mover]));
+                    args.set("against", Json::Arr(near));
+                }
+            }
+            steps.push(Step::op("find_limits", args, format!("find how far {name} can move")).soft().bind(format!("limits:{name}"), &["/values/0"]));
+            steps.push(Step::tool("auto_limits", obj! {"joint" => name.as_str(), "found" => var(&format!("limits:{name}"))}, format!("limit {name}")).soft().needs(format!("limits:{name}")));
         }
     }
     for c in &a.joints.constraints {
@@ -259,7 +299,7 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
     }
     steps.push(Step::op("doc_metadata", obj! {"values" => obj!{"io.github.lcw.bridge" => obj!{"properties" => props}}}, "assembly properties").soft());
     steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {name}")));
-    DesignSteps { name, file: out_file.to_string(), steps }
+    DesignSteps { name, file: out_file.to_string(), steps, notes }
 }
 
 fn fmt_v(v: V3) -> String {
@@ -309,6 +349,7 @@ fn place_children(a: &Analysis, def: usize, prefix: &[usize], parent_var: Option
                 Some(cvar) => {
                     steps.push(Step::op("copy_occurrence", obj! {"component" => var(&cvar), "parent" => parent.clone()}, format!("another {}", child.name)).bind(&vname, &["/occurrence"]));
                     placed.occ.insert(path.clone(), vname.clone());
+                    placed.copies.insert(path.clone());
                     steps.push(place_step(&vname, &o.transform, &o.id));
                     // Its contents are the first copy's; map their paths onto the first copy's vars.
                     let first = placed.first_path.get(&o.def).cloned().unwrap_or_default();
@@ -504,4 +545,25 @@ fn pattern_steps(a: &Analysis, p: &lcw_analyze::PatternPlan, placed: &Placed) ->
 fn fmt_num(v: f64) -> String {
     let s = format!("{v:.9}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Each placed part's box in the assembly's coordinates, by instance path.
+fn world_boxes(a: &Analysis) -> BTreeMap<Vec<usize>, Bbox> {
+    let mut out = BTreeMap::new();
+    for inst in &a.instances {
+        let d = &a.model.defs[inst.def];
+        if d.assembly || d.solids.is_empty() {
+            continue;
+        }
+        let pts = d.solids.iter().flat_map(|s| s.faces.iter().flat_map(|f| f.vertices.iter())).map(|p| inst.world.point(*p));
+        let b = Bbox::of(pts);
+        if !b.is_empty() {
+            out.insert(inst.path.clone(), b);
+        }
+    }
+    out
+}
+
+fn overlaps(a: &Bbox, b: &Bbox, pad: f64) -> bool {
+    a.min.x - pad <= b.max.x && b.min.x - pad <= a.max.x && a.min.y - pad <= b.max.y && b.min.y - pad <= a.max.y && a.min.z - pad <= b.max.z && b.min.z - pad <= a.max.z
 }

@@ -126,6 +126,8 @@ pub struct DesignSteps {
     /// The .sc file it is saved as.
     pub file: String,
     pub steps: Vec<Step>,
+    /// What was left out of this design and why, for the report.
+    pub notes: Vec<String>,
 }
 
 #[cfg(test)]

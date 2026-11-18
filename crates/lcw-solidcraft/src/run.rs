@@ -239,6 +239,7 @@ mod tests {
                 Step::op("ground", obj! {"occurrence" => var("missing")}, "ground").soft(),
                 Step::tool("save", obj! {"path" => "t.sc"}, "save"),
             ],
+            notes: Vec::new(),
         };
         let mut runner = Runner::new(&mut rec, &profile);
         let r = runner.run(&design);

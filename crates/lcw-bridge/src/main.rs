@@ -267,6 +267,7 @@ fn convert(a: &Args, input: &Path) -> Result<bool, String> {
     }
     let asm_file = target(&out.join(format!("{}.sc", analysis.model.defs[analysis.model.root].key)));
     let assembly = assembly_steps(&analysis, &part_files, &asm_file, &eo);
+    analysis.notes.extend(assembly.notes.iter().cloned());
     let plan = BuildPlan { parts, assembly, part_defs };
     std::fs::write(out.join("build-steps.json"), plan.to_json().to_pretty()).map_err(|e| e.to_string())?;
     eprintln!(
