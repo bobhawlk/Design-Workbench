@@ -54,3 +54,16 @@ Steps refer to SolidCraft's ids through bindings (`"${occ:3.1}"`), filled in as 
 - **Writing `.sc` files directly**: the fastest path, but it breaks with every format bump.
 - **An importer plugin (`file.import`)**: SolidCraft's importer world writes a design file, so it has the same problem. It also has no access to commands.
 - **A command plugin**: it does have `run(command, args)`, the same command surface as the runner. Once SolidCraft's plugin API is stable, a thin plugin can wrap `lcw-analyze` + `lcw-solidcraft` (they are dependency-free and build for wasm) to give an *Import Inventor bundle* menu item inside SolidCraft.
+
+## Known limits, from real runs
+
+Run against a real King Air console assembly (78 parts, 11 sheet metal, 31 joints) in SolidCraft 0.44.1:
+
+- All solid parts place and save. A part with surfaces but no solid body (a reference sketch exported as STEP) is left out and reported, rather than sent to `file.insert_step` to fail there.
+- 30 of 31 pivots build, each with its travel limits found by `joint.find_limits` swept only against the parts near it (SolidCraft cheks at most 256 bodies in one contact sweep; sweeping the whole assembly for every pivot would exceed that on a large design). The one pivot that doesn't build is between two parts that are both inside the same copy of a repeated sub-assembly: SolidCraft anchors a joint's origins on the occurrence they were picked on, and two parts inside one copy resolve to that copy's own occurrence, which `joint.create` refuses (fine on the first copy, where the pick is also the definition). This is reported and left out rather than attempted.
+- 8 of 11 sheet metal parts convert. The rest stay solid bodies (still placed and joined) and are flagged in the report and the parts table:
+  - A bend that runs across a face it meets at more than one edge (`a chamfer picked as a bend that runs along a face more than once`): not supported by `sheet.convert` yet.
+  - A pocket in a panel deeper than half the sheet: not supported by `sheet.convert` yet; converting and then cutting the pocket by hand works.
+  - A body whose faces don't stitch into one closed sheet (`sew: the faces do not close`): a geometry issue in the source STEP.
+  - A bend that would close a loop of bends (the sheet can't fold flat with every edge a bend): the profile's `sheet_convert` op retries without the offending bend, leaving that edge cut open, which the runner and `Run-BuildSteps.ps1` both do automatically.
+- The repository's own generated test fixture (`crates/lcw-analyze/tests/bracket_rack.stp`, built by `tools/make_fixtures.py`) has one bend SolidCraft's mesher doesn't recognise as lying between two faces, even though the two faces correctly share one `EDGE_CURVE` in the STEP (checked by hand). Real Inventor-exported bends at the same scale convert without issue, so this looks like a tessellation corner case triggered by the fixture's minimal, hand-built geometry rather than a bug in inv2sc's bend-point selection; it is not blocking, since the fixture is a test aid, not shipped data.

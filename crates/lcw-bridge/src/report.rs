@@ -13,6 +13,13 @@ fn name_of(a: &Analysis, path: &[usize]) -> String {
 pub fn markdown(a: &Analysis, runs: &[DesignResult], probe: &[String]) -> String {
     let m = &a.model;
     let mut s = String::new();
+    // Parts whose `sheet.convert` step failed: they stayed solid in SolidCraft even though the
+    // plan called for sheet metal.
+    let sheet_failed: std::collections::BTreeSet<&str> = runs
+        .iter()
+        .filter(|r| r.failures().any(|f| f.label.starts_with("make ") && f.label.ends_with(" sheet metal")))
+        .map(|r| r.name.as_str())
+        .collect();
     let root = &m.defs[m.root];
     let parts_used: std::collections::BTreeSet<usize> = a.instances.iter().filter(|x| !m.defs[x.def].assembly).map(|x| x.def).collect();
     s.push_str(&format!("# {} → SolidCraft\n\n", root.name));
@@ -43,6 +50,14 @@ pub fn markdown(a: &Analysis, runs: &[DesignResult], probe: &[String]) -> String
                 sp.notes.join("; "),
             ),
             None => ("solid".to_string(), String::new()),
+        };
+        let (becomes, notes) = if sheet_failed.contains(def.name.as_str()) {
+            (
+                "solid (sheet metal conversion failed)".to_string(),
+                if notes.is_empty() { "see Build in SolidCraft below".to_string() } else { format!("{notes}; see Build in SolidCraft below") },
+            )
+        } else {
+            (becomes, notes)
         };
         let mirror = a.mirrors.iter().find(|x| x.part == *d).map(|x| format!("mirror image of {}", m.defs[x.of].name)).unwrap_or_default();
         let notes = [notes, mirror].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join("; ");
