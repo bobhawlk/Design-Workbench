@@ -50,3 +50,35 @@ fn a_bracket_rack_builds_with_every_reference_resolved() {
     assert!(cmds.iter().any(|c| c == "parameters.change"), "the pattern spacing is a parameter");
     assert!(cmds.iter().any(|c| c == "occurrence.ground"));
 }
+
+#[test]
+fn the_bracket_rack_builds_the_same_in_batches() {
+    let model = Model::from_step(&fixture("bracket_rack.stp")).expect("model");
+    let a = analyze(model, &Options::default());
+    let eo = EmitOptions { out_dir: "/out".into(), ..EmitOptions::default() };
+    let mut files = BTreeMap::new();
+    let mut designs = Vec::new();
+    for (i, d) in a.model.defs.iter().enumerate().filter(|(_, d)| !d.assembly) {
+        let file = format!("/out/parts/{}.sc", d.key);
+        designs.push(part_steps(&a, i, &format!("/out/parts/{}.stp", d.key), &file, &eo));
+        files.insert(i, file);
+    }
+    designs.push(assembly_steps(&a, &files, "/out/rack.sc", &eo));
+    let refs: Vec<&lcw_solidcraft::steps::DesignSteps> = designs.iter().collect();
+    let profile = Profile::builtin();
+    let (mut one, mut many) = (Recorder::new(), Recorder::new());
+    let r1 = Runner::new(&mut one, &profile).run_all(&refs);
+    let r2 = {
+        let mut runner = Runner::new(&mut many, &profile);
+        runner.batch = 100;
+        runner.run_all(&refs)
+    };
+    for (x, y) in r1.iter().zip(&r2) {
+        assert!(y.saved, "{}", y.name);
+        assert_eq!(x.steps.iter().map(|s| s.status.name()).collect::<Vec<_>>(), y.steps.iter().map(|s| s.status.name()).collect::<Vec<_>>(), "{}", x.name);
+    }
+    assert_eq!(one.commands(), many.commands());
+    let trips = |r: &Recorder| r.calls.iter().filter(|(t, _)| t != "batch step").count();
+    eprintln!("round trips: {} one at a time, {} in batches", trips(&one), trips(&many));
+    assert!(trips(&many) < trips(&one));
+}

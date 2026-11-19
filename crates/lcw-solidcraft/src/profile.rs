@@ -7,6 +7,8 @@
 
 use std::collections::BTreeMap;
 
+use std::time::Duration;
+
 use lcw_json::Json;
 
 pub const BUILTIN: &str = include_str!("../../../profiles/solidcraft.json");
@@ -21,6 +23,8 @@ pub struct Op {
     /// (inv2sc's name) and run again, when the error contains `when`. For example a bend that
     /// closes a loop of bends: leaving it out cuts the sheet open there.
     pub drop_point: Option<DropPoint>,
+    /// How long one call of this op may take (`timeout_s`), when it is known to be slow.
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,12 +40,102 @@ pub struct Profile {
     pub tested_with: Vec<String>,
     /// Ops a probe found missing or changed (filled by [`Profile::check`]).
     pub disabled: BTreeMap<String, String>,
+    /// How the runner calls SolidCraft beyond `execute` (`runner`).
+    pub runner: RunnerProfile,
+}
+
+/// The `runner` section: timeouts, the `batch` tool and the answer of a call still running.
+#[derive(Debug, Clone)]
+pub struct RunnerProfile {
+    /// A call's timeout when its op or tool names none.
+    pub timeout: Duration,
+    /// Session tools' own timeouts (`save`, `open`…).
+    pub tool_timeouts: BTreeMap<String, Duration>,
+    pub batch: Option<BatchProfile>,
+    pub still_running: Option<StillRunning>,
+}
+
+/// SolidCraft's `batch` tool: its name, its argument names and where its reply keeps things.
+#[derive(Debug, Clone)]
+pub struct BatchProfile {
+    pub tool: String,
+    pub commands: String,
+    pub step_command: String,
+    pub step_params: String,
+    /// Fixed arguments sent with every batch (rollback off, timings on…).
+    pub args: Json,
+    /// Pointers into the reply (a success, or the error text of a failure parsed as JSON).
+    pub results: String,
+    pub failed_index: String,
+    pub failed_error: String,
+    pub rolled_back: String,
+    pub timings: String,
+    pub timing_index: String,
+    pub timing_ms: String,
+}
+
+/// A bridged call that outlived the bridge's own wait answers with an error starting `marker`;
+/// `pending_tool` waits for its result and `cancel_tool` cancels it.
+#[derive(Debug, Clone)]
+pub struct StillRunning {
+    pub marker: String,
+    pub pending_tool: String,
+    pub done: String,
+    pub result: String,
+    pub cancel_tool: Option<String>,
+}
+
+/// The timeout of a call when nothing else names one.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+
+impl Default for RunnerProfile {
+    fn default() -> RunnerProfile {
+        RunnerProfile { timeout: DEFAULT_TIMEOUT, tool_timeouts: BTreeMap::new(), batch: None, still_running: None }
+    }
+}
+
+fn seconds(j: Option<&Json>) -> Option<Duration> {
+    j.and_then(Json::as_f64).filter(|s| s.is_finite() && *s > 0.0).map(Duration::from_secs_f64)
+}
+
+impl RunnerProfile {
+    fn parse(j: Option<&Json>) -> Result<RunnerProfile, String> {
+        let Some(j) = j else { return Ok(RunnerProfile::default()) };
+        let mut r = RunnerProfile { timeout: seconds(j.get("timeout_s")).unwrap_or(DEFAULT_TIMEOUT), ..RunnerProfile::default() };
+        for (k, v) in j.get("tool_timeout_s").and_then(Json::as_object).unwrap_or(&[]) {
+            if let Some(d) = seconds(Some(v)) {
+                r.tool_timeouts.insert(k.clone(), d);
+            }
+        }
+        if let Some(b) = j.get("batch").filter(|b| !b.is_null()) {
+            let s = |k: &str| b.str_of(k).map(str::to_string).ok_or_else(|| format!("runner.batch has no `{k}`"));
+            r.batch = Some(BatchProfile {
+                tool: s("tool")?,
+                commands: s("commands")?,
+                step_command: s("step_command")?,
+                step_params: s("step_params")?,
+                args: b.get("args").cloned().filter(|a| a.as_object().is_some()).unwrap_or_else(Json::obj),
+                results: s("results")?,
+                failed_index: s("failed_index")?,
+                failed_error: s("failed_error")?,
+                rolled_back: s("rolled_back")?,
+                timings: b.str_of("timings").unwrap_or_default().to_string(),
+                timing_index: b.str_of("timing_index").unwrap_or_default().to_string(),
+                timing_ms: b.str_of("timing_ms").unwrap_or_default().to_string(),
+            });
+        }
+        if let Some(w) = j.get("still_running").filter(|w| !w.is_null()) {
+            let s = |k: &str| w.str_of(k).map(str::to_string).ok_or_else(|| format!("runner.still_running has no `{k}`"));
+            r.still_running = Some(StillRunning { marker: s("marker")?, pending_tool: s("pending_tool")?, done: s("done")?, result: s("result")?, cancel_tool: w.str_of("cancel_tool").map(str::to_string) });
+        }
+        Ok(r)
+    }
 }
 
 impl Profile {
     pub fn builtin() -> Profile {
         // The built-in profile is checked by a test; a broken one cannot ship.
-        Profile::parse(BUILTIN).unwrap_or_else(|_| Profile { ops: BTreeMap::new(), fallbacks: BTreeMap::new(), tested_with: Vec::new(), disabled: BTreeMap::new() })
+        Profile::parse(BUILTIN).unwrap_or_else(|_| Profile { ops: BTreeMap::new(), fallbacks: BTreeMap::new(), tested_with: Vec::new(), disabled: BTreeMap::new(), runner: RunnerProfile::default() })
     }
 
     pub fn parse(text: &str) -> Result<Profile, String> {
@@ -60,7 +154,7 @@ impl Profile {
             let drop_point = o.get("retry_dropping_point").and_then(|r| {
                 Some(DropPoint { param: r.str_of("param")?.to_string(), when: r.arr_of("when").iter().filter_map(|x| x.as_str().map(str::to_string)).collect() })
             });
-            ops.insert(name.clone(), Op { command, params, drop_point });
+            ops.insert(name.clone(), Op { command, params, drop_point, timeout: seconds(o.get("timeout_s")) });
         }
         let fallbacks = j
             .get("fallbacks")
@@ -68,7 +162,19 @@ impl Profile {
             .map(|f| f.iter().map(|(k, v)| (k.clone(), v.as_array().unwrap_or(&[]).iter().filter_map(|x| x.as_str().map(str::to_string)).collect())).collect())
             .unwrap_or_default();
         let tested_with = j.arr_of("tested_with").iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
-        Ok(Profile { ops, fallbacks, tested_with, disabled: BTreeMap::new() })
+        let runner = RunnerProfile::parse(j.get("runner"))?;
+        Ok(Profile { ops, fallbacks, tested_with, disabled: BTreeMap::new(), runner })
+    }
+
+    /// How long one call of `op` (or, without an op, of the session tool `tool`) may take:
+    /// the op's or tool's own timeout, never less than `floor` (the run's `--timeout`).
+    pub fn timeout_for(&self, op: Option<&str>, tool: &str, floor: Option<Duration>) -> Duration {
+        let own = match op {
+            Some(op) => self.ops.get(op).and_then(|o| o.timeout),
+            None => self.runner.tool_timeouts.get(tool).copied(),
+        };
+        let base = floor.unwrap_or(self.runner.timeout);
+        own.map_or(base, |t| t.max(base))
     }
 
     pub fn available(&self, op: &str) -> bool {
@@ -216,5 +322,20 @@ mod tests {
         assert!(report.iter().any(|r| r.contains("constraint") && r.contains("instead")), "{report:?}");
         assert_eq!(p.resolve("constraint"), Some("joint"));
         assert_eq!(p.resolve("place"), Some("place"));
+    }
+
+    #[test]
+    fn timeouts_come_from_the_profile_and_the_floor_raises_them() {
+        let p = Profile::builtin();
+        assert_eq!(p.timeout_for(Some("place"), "execute", None), Duration::from_secs(300));
+        assert_eq!(p.timeout_for(Some("find_limits"), "execute", None), Duration::from_secs(900));
+        assert_eq!(p.timeout_for(None, "save", None), Duration::from_secs(600));
+        assert_eq!(p.timeout_for(Some("find_limits"), "execute", Some(Duration::from_secs(1200))), Duration::from_secs(1200));
+        assert_eq!(p.timeout_for(Some("place"), "execute", Some(Duration::from_secs(5))), Duration::from_secs(5));
+        assert!(p.runner.batch.is_some() && p.runner.still_running.is_some());
+        // An older profile without a runner section still works, without batching.
+        let old = Profile::parse(r#"{"schema": "lcw-solidcraft-profile/1", "ops": {"place": {"command": "x.y"}}}"#).unwrap();
+        assert!(old.runner.batch.is_none());
+        assert_eq!(old.timeout_for(Some("place"), "execute", None), DEFAULT_TIMEOUT);
     }
 }

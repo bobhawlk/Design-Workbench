@@ -87,13 +87,14 @@ pub fn param_name(s: &str) -> String {
 /// The steps that build one part's design from its STEP.
 pub fn part_steps(a: &Analysis, def: usize, step_path: &str, out_file: &str, opts: &Options) -> DesignSteps {
     let d = &a.model.defs[def];
-    let mut steps = vec![Step::tool("new_design", Json::obj(), format!("new design for {}", d.name))];
+    let mut steps = vec![Step::tool("new_design", Json::obj(), format!("new design for {}", d.name)).group("new design")];
     steps.push(
         Step::op("insert_step", obj! {"path" => step_path, "name" => d.key.as_str(), "names" => "solid"}, format!("import {}", d.name))
             .bind("part_component", &["/component"])
-            .bind("body", &["/created_bodies/0", "/bodies/0/name", "/bodies/0"]),
+            .bind("body", &["/created_bodies/0", "/bodies/0/name", "/bodies/0"])
+            .group("import"),
     );
-    steps.push(Step::op("list_bodies", obj! {"names_only" => true}, "read the body name").soft().bind("body", &["/bodies/0/name", "/bodies/0/definition", "/bodies/0"]));
+    steps.push(Step::op("list_bodies", obj! {"names_only" => true}, "read the body name").soft().bind("body", &["/bodies/0/name", "/bodies/0/definition", "/bodies/0"]).group("import"));
     if opts.sheet_metal {
         if let Some(sp) = a.sheets.get(&def) {
             steps.extend(sheet_steps(sp, &d.name));
@@ -122,7 +123,7 @@ pub fn part_steps(a: &Analysis, def: usize, step_path: &str, out_file: &str, opt
     if let Some(desc) = d.properties.get("Description").filter(|s| !s.trim().is_empty()) {
         values.set("description", desc.as_str());
     }
-    steps.push(Step::op("doc_metadata", obj! {"values" => values}, "part properties").soft());
+    steps.push(Step::op("doc_metadata", obj! {"values" => values}, "part properties").soft().group("properties"));
     // Material and free properties are a component's part properties.
     let mut cm = obj! {"component" => var("part_component"), "properties" => props};
     if let Some(pn) = d.part_number.clone().filter(|s| !s.trim().is_empty()) {
@@ -131,8 +132,8 @@ pub fn part_steps(a: &Analysis, def: usize, step_path: &str, out_file: &str, opt
     if let Some(m) = d.material.clone().filter(|s| !s.trim().is_empty()) {
         cm.set("material", m.as_str());
     }
-    steps.push(Step::op("component_metadata", cm, "part material and properties").soft().needs("part_component"));
-    steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {}", d.name)));
+    steps.push(Step::op("component_metadata", cm, "part material and properties").soft().needs("part_component").group("properties"));
+    steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {}", d.name)).group("save"));
     DesignSteps { name: d.name.clone(), file: out_file.to_string(), steps, notes: Vec::new() }
 }
 
@@ -144,8 +145,8 @@ fn sheet_steps(sp: &SheetPlan, name: &str) -> Vec<Step> {
         convert.set("bends", Json::Arr(bends));
     }
     vec![
-        Step::op("sheet_rule", rule, format!("sheet metal rule {}", sp.rule)).soft(),
-        Step::op("sheet_convert", convert, format!("make {name} sheet metal")).soft().needs("body").bind("sheet", &["/name", "/id"]),
+        Step::op("sheet_rule", rule, format!("sheet metal rule {}", sp.rule)).soft().group("sheet metal"),
+        Step::op("sheet_convert", convert, format!("make {name} sheet metal")).soft().needs("body").bind("sheet", &["/name", "/id"]).group("sheet metal"),
     ]
 }
 
@@ -176,7 +177,7 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
     let m = &a.model;
     let root = &m.defs[m.root];
     let name = opts.assembly_name.clone().unwrap_or_else(|| root.name.clone());
-    let mut steps = vec![Step::tool("new_design", Json::obj(), format!("new design for {name}"))];
+    let mut steps = vec![Step::tool("new_design", Json::obj(), format!("new design for {name}")).group("new design")];
     let mut placed = Placed::default();
     place_children(a, m.root, &[], None, part_files, &mut placed, &mut steps, opts);
     // Patterns: one parameter per spacing.
@@ -190,13 +191,13 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
     if let Some(first) = &placed.first_part {
         if !ground.contains(first) {
             if let Some(v) = placed.occ.get(first) {
-                steps.push(Step::op("ground", obj! {"occurrence" => var(v), "grounded" => false}, "release the automatic ground").soft());
+                steps.push(Step::op("ground", obj! {"occurrence" => var(v), "grounded" => false}, "release the automatic ground").soft().group("grounding"));
             }
         }
     }
     for g in &ground {
         if let Some(v) = placed.occ.get(g) {
-            steps.push(Step::op("ground", obj! {"occurrence" => var(v), "grounded" => true}, format!("ground {}", inst_name(a, g))).soft());
+            steps.push(Step::op("ground", obj! {"occurrence" => var(v), "grounded" => true}, format!("ground {}", inst_name(a, g))).soft().group("grounding"));
         }
     }
     // Sub-assembly containers stay with the ground (their children move by their own joints).
@@ -215,7 +216,7 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
         let addressable = g.iter().all(|p| !placed.repeated.contains(p) && placed.occ.contains_key(p));
         if addressable && g.len() >= 2 {
             let list: Vec<Json> = g.iter().filter_map(|p| placed.occ.get(p)).map(|v| var(v)).collect();
-            steps.push(Step::op("rigid_group", obj! {"occurrences" => Json::Arr(list)}, format!("hold {} part(s) to {}", g.len() - 1, inst_name(a, &g[0]))).soft());
+            steps.push(Step::op("rigid_group", obj! {"occurrences" => Json::Arr(list)}, format!("hold {} part(s) to {}", g.len() - 1, inst_name(a, &g[0]))).soft().group("rigid groups"));
         } else {
             for p in &g[1..] {
                 let origin = a.instances.iter().find(|x| &x.path == p).map_or(V3::ZERO, |x| x.world.origin());
@@ -230,7 +231,7 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
                     limits: Vec::new(),
                     source: lcw_analyze::joints::Source::Inferred("rigid group".into()),
                 };
-                steps.push(joint_step(a, &placed, &j, false));
+                steps.push(joint_step(a, &placed, &j, false).group("rigid groups"));
             }
         }
     }
@@ -280,8 +281,8 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
                     args.set("against", Json::Arr(near));
                 }
             }
-            steps.push(Step::op("find_limits", args, format!("find how far {name} can move")).soft().bind(format!("limits:{name}"), &["/values/0"]));
-            steps.push(Step::tool("auto_limits", obj! {"joint" => name.as_str(), "found" => var(&format!("limits:{name}"))}, format!("limit {name}")).soft().needs(format!("limits:{name}")));
+            steps.push(Step::op("find_limits", args, format!("find how far {name} can move")).soft().bind(format!("limits:{name}"), &["/values/0"]).group("limits"));
+            steps.push(Step::tool("auto_limits", obj! {"joint" => name.as_str(), "found" => var(&format!("limits:{name}"))}, format!("limit {name}")).soft().needs(format!("limits:{name}")).group("limits"));
         }
     }
     for c in &a.joints.constraints {
@@ -297,8 +298,8 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
         let s: Vec<String> = a.patterns.iter().map(|p| format!("{}: {}", p.name, describe_pattern(&p.found.kind))).collect();
         props.set("Patterns", s.join("; "));
     }
-    steps.push(Step::op("doc_metadata", obj! {"values" => obj!{"io.github.lcw.bridge" => obj!{"properties" => props}}}, "assembly properties").soft());
-    steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {name}")));
+    steps.push(Step::op("doc_metadata", obj! {"values" => obj!{"io.github.lcw.bridge" => obj!{"properties" => props}}}, "assembly properties").soft().group("properties"));
+    steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {name}")).group("save"));
     DesignSteps { name, file: out_file.to_string(), steps, notes }
 }
 
@@ -338,7 +339,8 @@ fn place_children(a: &Analysis, def: usize, prefix: &[usize], parent_var: Option
                     steps.push(
                         Step::op("create_component", obj! {"name" => child.key.as_str(), "parent" => parent.clone(), "activate" => false, "grounded" => false}, format!("sub-assembly {}", child.name))
                             .bind(&cvar, &["/component"])
-                            .bind(&vname, &["/occurrence"]),
+                            .bind(&vname, &["/occurrence"])
+                            .group("components"),
                     );
                     placed.asm_component.insert(o.def, cvar.clone());
                     placed.first_path.insert(o.def, path.clone());
@@ -347,7 +349,7 @@ fn place_children(a: &Analysis, def: usize, prefix: &[usize], parent_var: Option
                     place_children(a, o.def, &path, Some(&cvar), part_files, placed, steps, opts);
                 }
                 Some(cvar) => {
-                    steps.push(Step::op("copy_occurrence", obj! {"component" => var(&cvar), "parent" => parent.clone()}, format!("another {}", child.name)).bind(&vname, &["/occurrence"]));
+                    steps.push(Step::op("copy_occurrence", obj! {"component" => var(&cvar), "parent" => parent.clone()}, format!("another {}", child.name)).bind(&vname, &["/occurrence"]).group("components"));
                     placed.occ.insert(path.clone(), vname.clone());
                     placed.copies.insert(path.clone());
                     steps.push(place_step(&vname, &o.transform, &o.id));
@@ -374,7 +376,8 @@ fn place_children(a: &Analysis, def: usize, prefix: &[usize], parent_var: Option
                     steps.push(
                         Step::op("insert_design", obj! {"path" => file.as_str(), "name" => child.key.as_str(), "parent" => parent.clone()}, format!("place {}", child.name))
                             .bind(&cvar, &["/component"])
-                            .bind(&vname, &["/occurrence"]),
+                            .bind(&vname, &["/occurrence"])
+                            .group("components"),
                     );
                     placed.part_component.insert(o.def, cvar);
                     if placed.first_part.is_none() && prefix.is_empty() {
@@ -382,7 +385,7 @@ fn place_children(a: &Analysis, def: usize, prefix: &[usize], parent_var: Option
                     }
                 }
                 Some(cvar) => {
-                    steps.push(Step::op("copy_occurrence", obj! {"component" => var(&cvar), "parent" => parent.clone()}, format!("another {}", child.name)).bind(&vname, &["/occurrence"]));
+                    steps.push(Step::op("copy_occurrence", obj! {"component" => var(&cvar), "parent" => parent.clone()}, format!("another {}", child.name)).bind(&vname, &["/occurrence"]).group("components"));
                 }
             }
             placed.occ.insert(path.clone(), vname.clone());
@@ -395,7 +398,7 @@ fn place_children(a: &Analysis, def: usize, prefix: &[usize], parent_var: Option
 }
 
 fn place_step(vname: &str, t: &M4, id: &str) -> Step {
-    Step::op("place", obj! {"occurrence" => var(vname), "to_matrix" => mat16(t), "space" => "local", "move_grounded" => true}, format!("place {id}"))
+    Step::op("place", obj! {"occurrence" => var(vname), "to_matrix" => mat16(t), "space" => "local", "move_grounded" => true}, format!("place {id}")).group("placement")
 }
 
 /// A joint origin on one side.
@@ -433,7 +436,7 @@ fn joint_step(a: &Analysis, placed: &Placed, j: &JointPlan, _limits_later: bool)
         lcw_analyze::joints::Source::InventorConstraint => "Inventor constraint".to_string(),
         lcw_analyze::joints::Source::Inferred(r) => format!("inferred: {r}"),
     };
-    Step::op("joint", p, format!("{} {} ({why})", j.kind.name(), j.name)).soft()
+    Step::op("joint", p, format!("{} {} ({why})", j.kind.name(), j.name)).soft().group("joints")
 }
 
 fn pick_origin(placed: &Placed, path: &[usize], pick: &Pick) -> Json {
@@ -474,7 +477,7 @@ fn constraint_step(a: &Analysis, placed: &Placed, c: &ConstraintPlan) -> Step {
         "mate" | "flush" | "distance" => Some("planar"),
         _ => None,
     };
-    let mut step = Step::op("constraint", p, format!("{} {} (Inventor constraint)", c.rule, c.name)).soft();
+    let mut step = Step::op("constraint", p, format!("{} {} (Inventor constraint)", c.rule, c.name)).soft().group("constraints");
     if let Some(kind) = kind {
         let (pt, z) = match &c.b.pick {
             Pick::Face(p) | Pick::Circle(p) => (*p, V3::Z),
@@ -507,7 +510,7 @@ fn pattern_steps(a: &Analysis, p: &lcw_analyze::PatternPlan, placed: &Placed) ->
         PatKind::Circular { .. } => return Vec::new(),
     };
     for (n, v) in &params {
-        steps.push(Step::op("parameter", obj! {"name" => n.as_str(), "expression" => mm(*v), "comment" => format!("{}: {}", p.name, describe_pattern(&p.found.kind))}, format!("parameter {n}")).soft().bind(format!("param:{n}"), &["/name", "/changed"]));
+        steps.push(Step::op("parameter", obj! {"name" => n.as_str(), "expression" => mm(*v), "comment" => format!("{}: {}", p.name, describe_pattern(&p.found.kind))}, format!("parameter {n}")).soft().bind(format!("param:{n}"), &["/name", "/changed"]).group("patterns"));
     }
     let seed = p.found.members[0];
     let seed_t = defs.occurrences[seed].transform;
@@ -532,10 +535,11 @@ fn pattern_steps(a: &Analysis, p: &lcw_analyze::PatternPlan, placed: &Placed) ->
             }
         };
         let final_t = defs.occurrences[mi].transform;
-        steps.push(Step::op("place", obj! {"occurrence" => var(v), "to_matrix" => mat16(&seed_t), "space" => "local", "move_grounded" => true}, format!("pattern seed position for {}", defs.occurrences[mi].id)).soft());
+        steps.push(Step::op("place", obj! {"occurrence" => var(v), "to_matrix" => mat16(&seed_t), "space" => "local", "move_grounded" => true}, format!("pattern seed position for {}", defs.occurrences[mi].id)).soft().group("patterns"));
         steps.push(
             Step::op("place", obj! {"occurrence" => var(v), "translate" => Json::Arr(vec![expr(0), expr(1), expr(2)]), "space" => "local", "move_grounded" => true}, format!("pattern member {} follows the spacing", defs.occurrences[mi].id))
                 .soft()
+                .group("patterns")
                 .or_else("place", obj! {"occurrence" => var(v), "to_matrix" => mat16(&final_t), "space" => "local", "move_grounded" => true}),
         );
     }

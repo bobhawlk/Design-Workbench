@@ -5,5 +5,6 @@
 pub mod emit;
 pub mod mcp;
 pub mod profile;
+pub mod progress;
 pub mod run;
 pub mod steps;

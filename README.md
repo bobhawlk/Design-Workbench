@@ -6,7 +6,7 @@ Turns Autodesk Inventor parts and assemblies into clean, editable [SolidCraft](h
 - **Sheet metal stays sheet metal.** Inventor's thickness, bend radius and K-factor become a SolidCraft sheet metal rule, and each part is converted with `sheet.convert` at its real bends. It unfolds, gives a flat pattern and DXF, and takes new flanges. Parts that came from a plain STEP are recognised from their faces.
 - **Constraints carry over.** Inventor mate, flush, insert, angle and tangent constraints become SolidCraft assembly constraints. Inventor joints (rigid, rotational, slider, cylindrical, planar, ball) become joints. For parts Inventor left unconstrained, joints are inferred from the geometry: shared hole and pin axes, fasteners, spacers and linkages. Travel limits come from where parts meet (`joint.find_limits`).
 - **Repeats, patterns and symmetry are recognised.** Placements in a row, a grid or round an axis become a pattern with its spacing as a parameter. Mirror planes and mirrored part pairs are found and recorded on the design.
-- **A report** (`conversion-report.md`) says what was found, what was decided and what SolidCraft did with every step.
+- **A report** (`conversion-report.md`) says what was planned and, separately, what SolidCraft actually built: per design and per step group, every failure with SolidCraft's own error, every step left out and why, and where the time went.
 
 It is built to keep working as SolidCraft changes, which it does quickly. See [Staying compatible](#staying-compatible).
 
@@ -60,6 +60,8 @@ inv2sc convert "console and base assembly.stp"
 ```
 
 To watch the result being built in the open SolidCraft window, turn on the control channel there (or start it with `solidcraft --control 7878`) and add `--connect 127.0.0.1:7878`.
+
+While it builds, inv2sc prints a line per step (at most a few a second) and keeps `progress.json` (where it is) and `build-log.jsonl` (every step as it finishes, with its time and SolidCraft's answer) in the output folder. A SolidCraft call that doesn't answer in time (`--timeout`, default 300 s, longer for the slow commands) fails its step, and the next design starts in a fresh SolidCraft session. `--batch 50` sends independent steps 50 at a time. `--relative-paths` makes `build-steps.json` movable: `inv2sc run <folder>\build-steps.json` builds it where it is.
 
 `inv2sc analyze <input>` prints the analysis without SolidCraft. `inv2sc convert <input> --dry-run` writes the report and `build-steps.json` without building. `inv2sc watch <folder>` converts each export that appears in a folder: the exporter writes a `ready` file last.
 

@@ -3,9 +3,9 @@
   "about": "How inv2sc's operations map onto SolidCraft commands. Written against SolidCraft 0.44 (main, November 2026). When a SolidCraft update renames a command or a parameter, change it here (or pass --profile with a copy): `inv2sc probe` checks every entry against the running SolidCraft and says which ones no longer fit.",
   "tested_with": ["0.44.1"],
   "ops": {
-    "insert_step":       {"command": "file.insert_step",           "params": {"path": "path", "name": "name", "names": "names"}},
+    "insert_step":       {"command": "file.insert_step",           "params": {"path": "path", "name": "name", "names": "names"}, "timeout_s": 600},
     "sheet_rule":        {"command": "sheet.manage_rules",         "params": {"name": "name", "thickness": "thickness", "k_factor": "k_factor", "bend_radius": "bend_radius", "active": "active"}},
-    "sheet_convert":     {"command": "sheet.convert",              "params": {"body": "body", "face": "face", "bends": "bends", "rule": "rule"},
+    "sheet_convert":     {"command": "sheet.convert",              "params": {"body": "body", "face": "face", "bends": "bends", "rule": "rule"}, "timeout_s": 600,
                           "retry_dropping_point": {"param": "bends", "when": ["closes a loop of bends", "a chamfer picked as a bend that runs along a face more than once"]}},
     "doc_metadata":      {"command": "document.metadata.set",      "params": {"values": "values", "key": "key", "value": "value"}},
     "component_metadata":{"command": "component.metadata.set",     "params": {"component": "component", "part_number": "part_number", "description": "description", "revision": "revision", "material": "material", "properties": "properties"}},
@@ -17,7 +17,7 @@
     "rigid_group":       {"command": "joint.rigid_group",          "params": {"occurrences": "occurrences"}},
     "joint":             {"command": "joint.create",               "params": {"type": "type", "a": "a", "b": "b", "flip": "flip", "name": "name", "limits": "limits", "quiet": "quiet"}},
     "constraint":        {"command": "assembly.constraint.create", "params": {"type": "type", "a": "a", "b": "b", "offset": "offset", "angle": "angle", "flip": "flip", "name": "name", "quiet": "quiet"}},
-    "find_limits":       {"command": "joint.find_limits",          "params": {"joint": "joint"}},
+    "find_limits":       {"command": "joint.find_limits",          "params": {"joint": "joint"}, "timeout_s": 900},
     "set_limits":        {"command": "joint.limits",               "params": {"joint": "joint", "index": "index", "min": "min", "max": "max"}},
     "parameter":         {"command": "parameters.change",          "params": {"name": "name", "expression": "expression", "comment": "comment"}},
     "list_bodies":       {"command": "inspect.measure",            "params": {"names_only": "names_only"}}
@@ -26,6 +26,18 @@
     "frame": {"point": "point", "z": "z", "x": "x", "occurrence": "occurrence", "path": "path"},
     "face": "face",
     "circle": "circle"
+  },
+  "runner": {
+    "about": "How the step runner talks to SolidCraft's MCP server beyond `execute`: how long a call may take (seconds; an op's own timeout_s wins), the `batch` tool (several commands in one call, run in order, stopping at the first error) and what a bridged call that is still running in the app answers.",
+    "timeout_s": 300,
+    "tool_timeout_s": {"save": 600, "open": 600},
+    "batch": {
+      "tool": "batch", "commands": "commands", "step_command": "command", "step_params": "params",
+      "args": {"rollback": false, "timings": true, "verbose": false},
+      "results": "/results", "failed_index": "/failed/index", "failed_error": "/failed/error", "rolled_back": "/rolled_back",
+      "timings": "/timings", "timing_index": "index", "timing_ms": "ms"
+    },
+    "still_running": {"marker": "still running:", "pending_tool": "pending", "done": "/done", "result": "/result", "cancel_tool": "cancel"}
   },
   "fallbacks": {
     "constraint": ["joint"],
