@@ -16,6 +16,7 @@ lcw-step = { path = "../lcw-step" }
 lcw-bundle = { path = "../lcw-bundle" }
 lcw-analyze = { path = "../lcw-analyze" }
 lcw-solidcraft = { path = "../lcw-solidcraft" }
+lcw-verify = { path = "../lcw-verify" }
 
 [lints]
 workspace = true

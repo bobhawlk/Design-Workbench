@@ -25,6 +25,10 @@ USAGE:
   inv2sc watch <folder> [options]       convert each bundle that appears in <folder>
   inv2sc run <build-steps.json> [options]   build from a steps file written earlier
   inv2sc probe [--solidcraft-cli PATH] [--connect HOST:PORT] [--profile FILE]
+  inv2sc verify <bundle-folder | bundle.json> [--built DIR] [--assembly FILE] [options]
+                check a finished build against the bundle: parts, placements, names, overall
+                box, interference. Writes verification-report.md and verification.json (to
+                --out, default the built folder); exits 1 when a check fails.
   inv2sc version
 
 OPTIONS:
@@ -54,6 +58,12 @@ OPTIONS:
                           next design starts in a new one
   --batch N               send up to N independent steps to SolidCraft in one `batch` call
                           (default 1: one at a time)
+  --built DIR             verify: the folder convert wrote (default: <bundle>/SolidCraft)
+  --assembly FILE         verify: the assembly design (default: <built>/<top assembly name>.sc)
+  --tol-mm MM             verify: position tolerance (default 0.05, or 1e-4 of the part's size)
+  --tol-deg DEG           verify: frame angle tolerance (default 0.05)
+  --clash-budget SECS     verify: time allowed for the interference check (default 600)
+  --no-clash              verify: skip the interference check
   --quiet                 no progress lines (progress.json and build-log.jsonl are still written)
   --verbose               print every step and its outcome
 ";
@@ -78,6 +88,12 @@ struct Args {
     timeout: Option<Duration>,
     batch: usize,
     quiet: bool,
+    built: Option<PathBuf>,
+    assembly: Option<PathBuf>,
+    tol_mm: Option<f64>,
+    tol_deg: Option<f64>,
+    clash_budget: Option<f64>,
+    no_clash: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -103,6 +119,12 @@ fn parse_args() -> Result<Args, String> {
         timeout: None,
         batch: 1,
         quiet: false,
+        built: None,
+        assembly: None,
+        tol_mm: None,
+        tol_deg: None,
+        clash_budget: None,
+        no_clash: false,
     };
     while let Some(x) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -128,6 +150,12 @@ fn parse_args() -> Result<Args, String> {
             "--verbose" | "-v" => a.verbose = true,
             "--quiet" | "-q" => a.quiet = true,
             "--relative-paths" => a.relative_paths = true,
+            "--built" => a.built = Some(PathBuf::from(value("--built")?)),
+            "--assembly" => a.assembly = Some(PathBuf::from(value("--assembly")?)),
+            "--tol-mm" => a.tol_mm = Some(value("--tol-mm")?.parse().map_err(|_| "--tol-mm takes a number of mm")?),
+            "--tol-deg" => a.tol_deg = Some(value("--tol-deg")?.parse().map_err(|_| "--tol-deg takes a number of degrees")?),
+            "--clash-budget" => a.clash_budget = Some(value("--clash-budget")?.parse().map_err(|_| "--clash-budget takes a number of seconds")?),
+            "--no-clash" => a.no_clash = true,
             "--timeout" => {
                 let secs: f64 = value("--timeout")?.parse().map_err(|_| "--timeout takes a number of seconds")?;
                 if !(secs.is_finite() && secs > 0.0) {
@@ -407,6 +435,72 @@ fn run_steps(a: &Args, steps: &Path) -> Result<bool, String> {
     Ok(runs.iter().all(|r| r.saved))
 }
 
+/// Check a finished build against the bundle it came from.
+fn verify(a: &Args, input: &Path) -> Result<bool, String> {
+    let bundle = lcw_bundle::Bundle::read(input).map_err(|e| e.to_string())?;
+    let root_name = bundle.root_doc().map(|d| d.name.clone()).ok_or("the bundle has no root document")?;
+    let base = if input.is_dir() { input.to_path_buf() } else { input.parent().map(Path::to_path_buf).unwrap_or_default() };
+    let built = a.built.clone().unwrap_or_else(|| base.join("SolidCraft"));
+    let assembly = match &a.assembly {
+        Some(p) => p.clone(),
+        None => {
+            // The converter names the assembly after the top document; its file name may have
+            // been made safe, so fall back to the only .sc file beside the parts folder.
+            let direct = built.join(format!("{root_name}.sc"));
+            if direct.is_file() {
+                direct
+            } else {
+                let found: Vec<PathBuf> = std::fs::read_dir(&built)
+                    .map_err(|e| format!("{}: {e}", built.display()))?
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "sc"))
+                    .collect();
+                match found.as_slice() {
+                    [one] => one.clone(),
+                    _ => return Err(format!("no assembly design `{root_name}.sc` in {}; pass --assembly FILE", built.display())),
+                }
+            }
+        }
+    };
+    let out = a.out.clone().unwrap_or_else(|| built.clone());
+    std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let mut tol = lcw_verify::Tol::default();
+    if let Some(x) = a.tol_mm {
+        tol.pos_mm = x;
+        tol.bbox_mm = x;
+    }
+    if let Some(x) = a.tol_deg {
+        tol.angle_deg = x;
+    }
+    if let Some(x) = a.clash_budget {
+        tol.interference_budget_s = x;
+    }
+    let mut profile = load_profile(a)?;
+    let bundle_dir = bundle.folder.clone().unwrap_or_else(|| base.clone());
+    let mut client = spawn(a, &[&built, &bundle_dir])?;
+    let (_, probe_report) = Runner::probe(&mut client, &mut profile)?;
+    for r in &probe_report {
+        eprintln!("  profile: {r}");
+    }
+    if a.no_clash {
+        profile.disabled.insert("interference".into(), "skipped (--no-clash)".into());
+    }
+    let quiet = a.quiet;
+    let log = move |m: &str| {
+        if !quiet {
+            eprintln!("verify: {m}");
+        }
+    };
+    let mut session = lcw_verify::session::Session::new(&mut client, &profile, a.timeout.unwrap_or(DEFAULT_TIMEOUT));
+    let report = lcw_verify::run(&mut session, &lcw_verify::Inputs { bundle: &bundle, built: &built, assembly: &assembly, tol: tol.clone(), log: &log })?;
+    std::fs::write(out.join("verification-report.md"), lcw_verify::report::markdown(&report, &tol)).map_err(|e| e.to_string())?;
+    std::fs::write(out.join("verification.json"), lcw_verify::report::json(&report, &tol).to_pretty()).map_err(|e| e.to_string())?;
+    println!("{}", report.summary_line());
+    println!("report: {}", out.join("verification-report.md").display());
+    Ok(!report.failed())
+}
+
 fn probe(a: &Args) -> Result<bool, String> {
     let mut profile = load_profile(a)?;
     let mut client = spawn(a, &[])?;
@@ -473,6 +567,12 @@ fn clone_args(a: &Args) -> Args {
         timeout: a.timeout,
         batch: a.batch,
         quiet: a.quiet,
+        built: a.built.clone(),
+        assembly: a.assembly.clone(),
+        tol_mm: a.tol_mm,
+        tol_deg: a.tol_deg,
+        clash_budget: a.clash_budget,
+        no_clash: a.no_clash,
     }
 }
 
@@ -491,6 +591,7 @@ fn main() -> ExitCode {
         "watch" => need_input().and_then(|i| watch(&args, &i)),
         "run" => need_input().and_then(|i| run_steps(&args, &i)),
         "probe" => probe(&args),
+        "verify" => need_input().and_then(|i| verify(&args, &i)),
         "version" | "--version" => {
             println!("inv2sc {}", env!("CARGO_PKG_VERSION"));
             Ok(true)

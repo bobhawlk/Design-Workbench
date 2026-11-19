@@ -52,6 +52,12 @@ Steps refer to SolidCraft's ids through bindings (`"${occ:3.1}"`), filled in as 
 
 The PowerShell runner does not have these yet: progress file and per-step log flushing (it writes `-Log` at the end), per-step timing, timeouts and session restarts, `pending`/`cancel`, `--batch`, `${steps_dir}` paths, reporting skipped and not-run steps with reasons, counting limit steps, and reporting a limit with one unknown end.
 
+### 6. Verify (`lcw-verify`)
+
+A separate crate that shares nothing of the converter's analysis or step building: only the bundle reader, the vector maths, the MCP client and the profile. `expect.rs` expands the bundle's occurrences into world placements; `obs.rs` reads SolidCraft's component tree (placements are row-vector matrices: translation in the last row, so they are transposed), links and per-instance measurements; `judge.rs` compares one instance with the part's own STEP placed by the bundle's matrix (centre of mass for position, the inertia tensor per unit mass for orientation, the box between the box of the transformed STEP vertices and of the transformed box corners); `assign.rs` pairs expected and built instances by minimum total cost, so a swapped pair of identical parts is not reported as two misplacements (names are judged separately); `verify.rs` makes the five checks. A scripted fake SolidCraft in `tests/` answers in the shapes the real one does.
+
+Reference for the part check: the bundle's `mass` (Inventor's volume and range box) when the exporter wrote it, and always SolidCraft's own import (`open`) of the bundle's STEP, which tests everything the converter does to a part.
+
 ## The profile
 
 `profiles/solidcraft.json` maps each operation (`insert_step`, `sheet_convert`, `joint`, …) to a command and its parameter names. The probe compares it with the running SolidCraft's catalogue and schemas:

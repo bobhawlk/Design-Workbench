@@ -16,7 +16,11 @@ pub const SCHEMA: &str = "lcw-solidcraft-profile/1";
 
 #[derive(Debug, Clone)]
 pub struct Op {
+    /// The SolidCraft command run through `execute` (empty for an op that is a session tool).
     pub command: String,
+    /// The MCP session tool this op calls directly (`open`, `measure`…), when it is not a
+    /// command. Used by `inv2sc verify`.
+    pub tool: Option<String>,
     /// inv2sc's parameter name → SolidCraft's.
     pub params: BTreeMap<String, String>,
     /// Retry after an error that names a point: drop the nearest point from a list parameter
@@ -42,6 +46,8 @@ pub struct Profile {
     pub disabled: BTreeMap<String, String>,
     /// How the runner calls SolidCraft beyond `execute` (`runner`).
     pub runner: RunnerProfile,
+    /// Where `inv2sc verify` finds things in SolidCraft's answers (`verify`).
+    pub verify: Json,
 }
 
 /// The `runner` section: timeouts, the `batch` tool and the answer of a call still running.
@@ -135,7 +141,7 @@ impl RunnerProfile {
 impl Profile {
     pub fn builtin() -> Profile {
         // The built-in profile is checked by a test; a broken one cannot ship.
-        Profile::parse(BUILTIN).unwrap_or_else(|_| Profile { ops: BTreeMap::new(), fallbacks: BTreeMap::new(), tested_with: Vec::new(), disabled: BTreeMap::new(), runner: RunnerProfile::default() })
+        Profile::parse(BUILTIN).unwrap_or_else(|_| Profile { ops: BTreeMap::new(), fallbacks: BTreeMap::new(), tested_with: Vec::new(), disabled: BTreeMap::new(), runner: RunnerProfile::default(), verify: Json::Null })
     }
 
     pub fn parse(text: &str) -> Result<Profile, String> {
@@ -145,7 +151,12 @@ impl Profile {
         }
         let mut ops = BTreeMap::new();
         for (name, o) in j.get("ops").and_then(Json::as_object).unwrap_or(&[]) {
-            let command = o.str_of("command").ok_or_else(|| format!("op `{name}` has no command"))?.to_string();
+            let tool = o.str_of("tool").map(str::to_string);
+            let command = match (o.str_of("command"), &tool) {
+                (Some(c), _) => c.to_string(),
+                (None, Some(_)) => String::new(),
+                (None, None) => return Err(format!("op `{name}` has no command or tool")),
+            };
             let params = o
                 .get("params")
                 .and_then(Json::as_object)
@@ -154,7 +165,7 @@ impl Profile {
             let drop_point = o.get("retry_dropping_point").and_then(|r| {
                 Some(DropPoint { param: r.str_of("param")?.to_string(), when: r.arr_of("when").iter().filter_map(|x| x.as_str().map(str::to_string)).collect() })
             });
-            ops.insert(name.clone(), Op { command, params, drop_point, timeout: seconds(o.get("timeout_s")) });
+            ops.insert(name.clone(), Op { command, tool, params, drop_point, timeout: seconds(o.get("timeout_s")) });
         }
         let fallbacks = j
             .get("fallbacks")
@@ -163,7 +174,7 @@ impl Profile {
             .unwrap_or_default();
         let tested_with = j.arr_of("tested_with").iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
         let runner = RunnerProfile::parse(j.get("runner"))?;
-        Ok(Profile { ops, fallbacks, tested_with, disabled: BTreeMap::new(), runner })
+        Ok(Profile { ops, fallbacks, tested_with, disabled: BTreeMap::new(), runner, verify: j.get("verify").cloned().unwrap_or(Json::Null) })
     }
 
     /// How long one call of `op` (or, without an op, of the session tool `tool`) may take:
@@ -175,6 +186,17 @@ impl Profile {
         };
         let base = floor.unwrap_or(self.runner.timeout);
         own.map_or(base, |t| t.max(base))
+    }
+
+    /// The name SolidCraft uses for `key` in the `verify` section's `group` (the key itself when
+    /// the profile does not rename it).
+    pub fn vname(&self, group: &str, key: &str) -> String {
+        self.verify.get(group).and_then(|g| g.str_of(key)).unwrap_or(key).to_string()
+    }
+
+    /// The session tool an op calls directly instead of a command (`open`, `measure`).
+    pub fn tool_of(&self, op: &str) -> Option<&str> {
+        self.ops.get(op).and_then(|o| o.tool.as_deref())
     }
 
     pub fn available(&self, op: &str) -> bool {
@@ -202,6 +224,9 @@ impl Profile {
     pub fn check(&mut self, catalog: &Catalog) -> Vec<String> {
         let mut report = Vec::new();
         for (name, op) in &self.ops {
+            if op.tool.is_some() {
+                continue;
+            }
             match catalog.commands.get(&op.command) {
                 None => {
                     self.disabled.insert(name.clone(), format!("SolidCraft has no command `{}`", op.command));
@@ -308,6 +333,19 @@ mod tests {
         let (cmd, params) = p.call("place", obj! {"occurrence" => 3, "to_matrix" => vec![1.0, 0.0], "nothing" => Json::Null}).unwrap();
         assert_eq!(cmd, "occurrence.move");
         assert_eq!(params.to_compact(), r#"{"occurrence":3,"to_matrix":[1,0]}"#);
+    }
+
+    #[test]
+    fn verify_ops_may_be_session_tools_and_the_verify_section_renames_keys() {
+        let mut p = Profile::builtin();
+        assert_eq!(p.tool_of("verify_open"), Some("open"));
+        assert_eq!(p.tool_of("list_components"), None);
+        assert_eq!(p.call("verify_measure", obj! {"summary" => true}).unwrap().1.to_compact(), r#"{"summary":true}"#);
+        assert_eq!(p.vname("props", "com"), "center_of_mass");
+        assert_eq!(p.vname("props", "unknown_key"), "unknown_key");
+        // A tool op is not looked for in the command catalogue.
+        let report = p.check(&Catalog { version: None, commands: Default::default() });
+        assert!(!report.iter().any(|r| r.starts_with("verify_open") || r.starts_with("verify_measure")), "{report:?}");
     }
 
     #[test]
