@@ -1,0 +1,16 @@
+[package]
+name = "lcw-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "inv2sc verify: check a SolidCraft build against the Inventor bundle it came from"
+
+[dependencies]
+lcw-json = { path = "../lcw-json" }
+lcw-geom = { path = "../lcw-geom" }
+lcw-step = { path = "../lcw-step" }
+lcw-bundle = { path = "../lcw-bundle" }
+lcw-solidcraft = { path = "../lcw-solidcraft" }
+
+[lints]
+workspace = true
