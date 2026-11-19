@@ -761,7 +761,10 @@ impl<'a> Runner<'a> {
         d.set("min_by", down.json());
         d.set("max_by", up.json());
         let (result, status) = match (&down, &up) {
-            (End::Contact { at: lo, .. }, End::Contact { at: hi, .. }) if hi - lo > 1e-6 => {
+            // Less than 2 (degrees or mm) between the stops means the part is jammed where it
+            // sits: a clash in the model, or parts wrongly grouped with it. Setting that as a
+            // limit would lock a part that should move, so it is reported and left free.
+            (End::Contact { at: lo, .. }, End::Contact { at: hi, .. }) if hi - lo >= 2.0 => {
                 d.set("min", *lo);
                 d.set("max", *hi);
                 let t = self.profile.timeout_for(Some("set_limits"), "execute", self.timeout);
@@ -771,7 +774,7 @@ impl<'a> Runner<'a> {
                     Err(e) => ("error", Status::Failed(format!("{}: {}", text_of("both ways stop at a contact, but setting the limits failed"), e.message()))),
                 }
             }
-            (End::Contact { .. }, End::Contact { .. }) => ("contact", Status::Skipped(text_of("limit not set: the travel between the two contacts is empty"))),
+            (End::Contact { .. }, End::Contact { .. }) => ("jammed", Status::Skipped(text_of("limit not set: under 2 of travel between the two contacts, so the part is jammed where it sits (a clash in the model, or parts wrongly grouped with it)"))),
             (End::Clear, End::Clear) => ("free", Status::Skipped(text_of(if unit == "deg" { "a full turn: nothing stops it, no limit" } else { "nothing stops it within its reach: no limit" }))),
             (End::Error(_), _) | (_, End::Error(_)) => ("error", Status::Failed(text_of("the search failed"))),
             (End::Budget { .. }, _) | (_, End::Budget { .. }) => ("not found", Status::Skipped(text_of("not found in time: no limit set"))),
