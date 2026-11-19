@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use lcw_analyze::joints::{ConstraintPlan, JointPlan, Kind, Pick};
+use lcw_analyze::joints::{ConstraintPlan, JointPlan, Kind, Pick, RigidGroup};
 use lcw_analyze::patterns::Kind as PatKind;
 use lcw_analyze::sheet::SheetPlan;
 use lcw_analyze::Analysis;
@@ -26,11 +26,13 @@ pub struct Options {
     pub parametric_patterns: bool,
     /// The name of the assembly design.
     pub assembly_name: Option<String>,
+    /// Check the mechanism in SolidCraft once the assembly is saved (`verify_joints`).
+    pub verify: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { out_dir: ".".into(), sep: std::path::MAIN_SEPARATOR, sheet_metal: true, find_limits: true, parametric_patterns: true, assembly_name: None }
+        Options { out_dir: ".".into(), sep: std::path::MAIN_SEPARATOR, sheet_metal: true, find_limits: true, parametric_patterns: true, assembly_name: None, verify: true }
     }
 }
 
@@ -207,29 +209,34 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
     let mut groups = a.joints.rigid_groups.clone();
     if let Some(anchor) = &anchor {
         if !containers.is_empty() {
-            let mut g = vec![anchor.clone()];
-            g.extend(containers.iter().cloned());
+            let mut g = RigidGroup { members: vec![anchor.clone()], why: vec!["anchor".into()] };
+            for c in &containers {
+                g.members.push(c.clone());
+                g.why.push("sub-assembly container (its parts move by their own joints)".into());
+            }
             groups.push(g);
         }
     }
     for g in &groups {
-        let addressable = g.iter().all(|p| !placed.repeated.contains(p) && placed.occ.contains_key(p));
-        if addressable && g.len() >= 2 {
-            let list: Vec<Json> = g.iter().filter_map(|p| placed.occ.get(p)).map(|v| var(v)).collect();
-            steps.push(Step::op("rigid_group", obj! {"occurrences" => Json::Arr(list)}, format!("hold {} part(s) to {}", g.len() - 1, inst_name(a, &g[0]))).soft().group("rigid groups"));
+        let m = &g.members;
+        let addressable = m.iter().all(|p| !placed.repeated.contains(p) && placed.occ.contains_key(p));
+        if addressable && m.len() >= 2 {
+            let list: Vec<Json> = m.iter().filter_map(|p| placed.occ.get(p)).map(|v| var(v)).collect();
+            steps.push(Step::op("rigid_group", obj! {"occurrences" => Json::Arr(list)}, format!("hold {} part(s) to {} ({})", m.len() - 1, inst_name(a, &m[0]), group_why(g))).soft().group("rigid groups"));
         } else {
-            for p in &g[1..] {
+            for (k, p) in m.iter().enumerate().skip(1) {
                 let origin = a.instances.iter().find(|x| &x.path == p).map_or(V3::ZERO, |x| x.world.origin());
                 let j = JointPlan {
                     name: format!("{} held", inst_name(a, p)),
                     kind: Kind::Rigid,
-                    a: g[0].clone(),
+                    a: m[0].clone(),
                     b: p.clone(),
                     origin,
                     z: V3::Z,
                     x: Some(V3::X),
                     limits: Vec::new(),
-                    source: lcw_analyze::joints::Source::Inferred("rigid group".into()),
+                    source: lcw_analyze::joints::Source::Inferred(g.why.get(k).cloned().unwrap_or_else(|| "rigid group".into())),
+                    evidence: Vec::new(),
                 };
                 steps.push(joint_step(a, &placed, &j, false).group("rigid groups"));
             }
@@ -245,6 +252,7 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
     });
     let boxes = world_boxes(a);
     let mut notes = Vec::new();
+    let mut made: Vec<Json> = Vec::new();
     for j in &a.joints.joints {
         // Both parts inside one copy of a repeated sub-assembly: SolidCraft anchors both sides on
         // that copy, so the joint can't be made there (the first placement's joint is).
@@ -259,6 +267,7 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
         let mut jj = j.clone();
         jj.name = name.clone();
         steps.push(joint_step(a, &placed, &jj, opts.find_limits));
+        made.push(obj! {"name" => name.as_str(), "type" => j.kind.name(), "basis" => j.basis()});
         if opts.find_limits && j.limits.is_empty() && matches!(j.kind, Kind::Revolute | Kind::Slider) {
             // Check the moving part only against the parts near it: a contact sweep of the whole
             // assembly is more bodies than SolidCraft sweeps at once.
@@ -286,7 +295,7 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
         }
     }
     for c in &a.joints.constraints {
-        steps.push(constraint_step(a, &placed, c));
+        steps.push(constraint_step(&placed, c));
     }
     // What the analysis found, on the design itself.
     let mut props = obj! {"Source file" => m.source_file.as_str(), "Converted by" => concat!("inv2sc ", env!("CARGO_PKG_VERSION"))};
@@ -300,7 +309,24 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
     }
     steps.push(Step::op("doc_metadata", obj! {"values" => obj!{"io.github.lcw.bridge" => obj!{"properties" => props}}}, "assembly properties").soft().group("properties"));
     steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {name}")).group("save"));
+    if opts.verify {
+        // After the save, so the drives it tries can't change the saved design.
+        steps.push(Step::tool("verify_joints", obj! {"joints" => Json::Arr(made)}, "check the mechanism: degrees of freedom, conflicts, and drive each joint").soft().group("verification"));
+    }
     DesignSteps { name, file: out_file.to_string(), steps, notes }
+}
+
+/// What a rigid group is, from its members' reasons.
+fn group_why(g: &RigidGroup) -> String {
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    for w in g.why.iter().skip(1) {
+        let k = w.split(" `").next().unwrap_or(w).split(" (").next().unwrap_or(w).trim().to_string();
+        *kinds.entry(k).or_default() += 1;
+    }
+    let mut s: Vec<String> = kinds.into_iter().map(|(k, n)| if n > 1 { format!("{n} × {k}") } else { k }).collect();
+    s.truncate(4);
+    let head = g.why.first().filter(|w| w.as_str() != "anchor").map(|w| format!("{w}; ")).unwrap_or_default();
+    format!("{head}{}", s.join(", "))
 }
 
 fn fmt_v(v: V3) -> String {
@@ -331,7 +357,9 @@ fn place_children(a: &Analysis, def: usize, prefix: &[usize], parent_var: Option
         path.push(i);
         let vname = format!("occ:{}", key(&path));
         let child = &m.defs[o.def];
-        let parent = parent_var.map(var).unwrap_or(Json::Null);
+        // The root by its id: `occurrence.copy` without a parent puts the copy in the copied
+        // placement's parent, which for a part first placed in a sub-assembly is the wrong one.
+        let parent = parent_var.map(var).unwrap_or(Json::from(0));
         if child.assembly {
             match placed.asm_component.get(&o.def).cloned() {
                 None => {
@@ -417,6 +445,16 @@ fn origin(a: &Analysis, placed: &Placed, path: &[usize], point: V3, z: V3, x: V3
     o
 }
 
+/// The placement of an instance as `occurrence_props` takes it, for a step's guard.
+fn guard_of(placed: &Placed, path: &[usize]) -> Option<Json> {
+    let mut o = obj! {"occurrence" => var(placed.occ.get(path)?)};
+    if placed.repeated.contains(path) {
+        let full: Vec<Json> = (1..=path.len()).filter_map(|i| placed.occ.get(&path[..i]).map(|v| var(v))).collect();
+        o.set("path", Json::Arr(full));
+    }
+    Some(o)
+}
+
 fn joint_step(a: &Analysis, placed: &Placed, j: &JointPlan, _limits_later: bool) -> Step {
     let z = j.z.unit().unwrap_or(V3::Z);
     let x = j.x.and_then(|x| (x - z * x.dot(z)).unit()).unwrap_or_else(|| z.any_perp());
@@ -431,12 +469,8 @@ fn joint_step(a: &Analysis, placed: &Placed, j: &JointPlan, _limits_later: bool)
     if !j.limits.is_empty() {
         p.set("limits", Json::Arr(j.limits.iter().map(|l| Json::from(*l)).collect()));
     }
-    let why = match &j.source {
-        lcw_analyze::joints::Source::InventorJoint => "Inventor joint".to_string(),
-        lcw_analyze::joints::Source::InventorConstraint => "Inventor constraint".to_string(),
-        lcw_analyze::joints::Source::Inferred(r) => format!("inferred: {r}"),
-    };
-    Step::op("joint", p, format!("{} {} ({why})", j.kind.name(), j.name)).soft().group("joints")
+    let guard: Vec<Json> = [&j.a, &j.b].iter().filter_map(|x| guard_of(placed, x)).collect();
+    Step::op("joint", p, format!("{} {} ({})", j.kind.name(), j.name, j.basis())).soft().group("joints").guard(guard)
 }
 
 fn pick_origin(placed: &Placed, path: &[usize], pick: &Pick) -> Json {
@@ -453,7 +487,7 @@ fn pick_origin(placed: &Placed, path: &[usize], pick: &Pick) -> Json {
     o
 }
 
-fn constraint_step(a: &Analysis, placed: &Placed, c: &ConstraintPlan) -> Step {
+fn constraint_step(placed: &Placed, c: &ConstraintPlan) -> Step {
     let mut p = obj! {
         "type" => c.rule.as_str(),
         "a" => pick_origin(placed, &c.a.path, &c.a.pick),
@@ -470,25 +504,10 @@ fn constraint_step(a: &Analysis, placed: &Placed, c: &ConstraintPlan) -> Step {
     if c.flip {
         p.set("flip", true);
     }
-    // Without the constraint command: the joint the rule stands for, where the parts are.
-    let kind = match c.rule.as_str() {
-        "insert" => Some("revolute"),
-        "concentric" => Some("cylindrical"),
-        "mate" | "flush" | "distance" => Some("planar"),
-        _ => None,
-    };
-    let mut step = Step::op("constraint", p, format!("{} {} (Inventor constraint)", c.rule, c.name)).soft().group("constraints");
-    if let Some(kind) = kind {
-        let (pt, z) = match &c.b.pick {
-            Pick::Face(p) | Pick::Circle(p) => (*p, V3::Z),
-            Pick::Frame { point, z } => (*point, *z),
-        };
-        let x = z.any_perp();
-        step = step.or_else(
-            "joint",
-            obj! {"type" => kind, "a" => origin(a, placed, &c.a.path, pt, z, x), "b" => origin(a, placed, &c.b.path, pt, z, x), "flip" => true, "name" => c.name.as_str(), "quiet" => true},
-        );
-    }
+    // No fallback to a joint: a joint made from a constraint's rule, at a guessed frame, frees or
+    // locks parts the constraint does not. A constraint SolidCraft refuses is reported.
+    let guard: Vec<Json> = [&c.a.path, &c.b.path].iter().filter_map(|x| guard_of(placed, x)).collect();
+    let step = Step::op("constraint", p, format!("{} {} (Inventor constraint)", c.rule, c.name)).soft().group("constraints").guard(guard);
     step
 }
 

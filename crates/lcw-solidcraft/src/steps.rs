@@ -36,11 +36,15 @@ pub struct Step {
     /// What kind of step it is, for the report ("import", "sheet metal", "joint"…); empty: the
     /// op or tool name.
     pub group: String,
+    /// Placements that must not move (`{occurrence, path?}`): read before and after the step,
+    /// and the step undone and reported when one of them moved. Placement is the truth; a
+    /// constraint or joint is kept only when the parts are still where Inventor had them.
+    pub guard: Vec<Json>,
 }
 
 impl Step {
     pub fn tool(tool: &str, args: Json, label: impl Into<String>) -> Step {
-        Step { tool: tool.into(), op: None, args, bind: Vec::new(), on_error: OnError::Stop, label: label.into(), needs: Vec::new(), alternatives: Vec::new(), group: String::new() }
+        Step { tool: tool.into(), op: None, args, bind: Vec::new(), on_error: OnError::Stop, label: label.into(), needs: Vec::new(), alternatives: Vec::new(), group: String::new(), guard: Vec::new() }
     }
     pub fn op(op: &str, params: Json, label: impl Into<String>) -> Step {
         Step {
@@ -53,7 +57,13 @@ impl Step {
             needs: Vec::new(),
             alternatives: Vec::new(),
             group: String::new(),
+            guard: Vec::new(),
         }
+    }
+    /// Undo the step when it moves any of these placements (see [`Step::guard`]).
+    pub fn guard(mut self, placements: Vec<Json>) -> Step {
+        self.guard = placements;
+        self
     }
     pub fn group(mut self, group: &str) -> Step {
         self.group = group.into();
@@ -109,6 +119,9 @@ impl Step {
         if !self.group.is_empty() {
             j.set("group", self.group.as_str());
         }
+        if !self.guard.is_empty() {
+            j.set("guard", Json::Arr(self.guard.clone()));
+        }
         j
     }
 
@@ -131,6 +144,7 @@ impl Step {
             needs: j.get("needs").map(strings).unwrap_or_default(),
             alternatives: j.arr_of("alternatives").iter().filter_map(|a| Some((a.str_of("op")?.to_string(), a.get("args").cloned().unwrap_or_else(Json::obj)))).collect(),
             group: j.str_of("group").unwrap_or_default().to_string(),
+            guard: j.arr_of("guard").to_vec(),
             tool,
         })
     }

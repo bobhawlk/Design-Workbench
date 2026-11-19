@@ -42,7 +42,7 @@ fn main() {
     }
     println!("rigid groups: {}", a.joints.rigid_groups.len());
     for g in &a.joints.rigid_groups {
-        println!("  [{}] {}", name(&g[0]), g[1..].iter().map(|p| name(p)).collect::<Vec<_>>().join(", "));
+        println!("  [{}] {}", name(&g.members[0]), g.members[1..].iter().map(|p| name(p)).collect::<Vec<_>>().join(", "));
     }
     for n in &a.notes {
         println!("note: {n}");

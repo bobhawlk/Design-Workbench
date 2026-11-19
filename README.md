@@ -4,7 +4,8 @@ Turns Autodesk Inventor parts and assemblies into clean, editable [SolidCraft](h
 
 - **One SolidCraft design per part**, linked into the assembly. A part placed 40 times is one file, as it is in Inventor, and identical parts saved as separate files (`Bracket`, `Bracket_2`) share one.
 - **Sheet metal stays sheet metal.** Inventor's thickness, bend radius and K-factor become a SolidCraft sheet metal rule, and each part is converted with `sheet.convert` at its real bends. It unfolds, gives a flat pattern and DXF, and takes new flanges. Parts that came from a plain STEP are recognised from their faces.
-- **Constraints carry over.** Inventor mate, flush, insert, angle and tangent constraints become SolidCraft assembly constraints. Inventor joints (rigid, rotational, slider, cylindrical, planar, ball) become joints. For parts Inventor left unconstrained, joints are inferred from the geometry: shared hole and pin axes, fasteners, spacers and linkages. Travel limits come from where parts meet (`joint.find_limits`).
+- **Joints come from the geometry, checked against Inventor.** For every assembly, whatever its source, pivots, rigid groups, fasteners, spacers and linkages are read off the parts' real geometry and placements: shared hole and pin axes, fasteners, round parts, parts pinned on two axes. Inventor's constraints are evidence: which parts the designer related and how (an insert confirms a pin, and a looser fit is tried where it found none; an angle constraint marks a part that turns; a mate or flush decides what a part with no pin is held to). An Inventor constraint becomes a SolidCraft constraint only when its exported geometry is complete and lands on the parts' faces; nothing is ever made from a guess that could lock or free parts. Inventor joints with an exported origin become joints. Travel limits come from where parts meet (`joint.find_limits`).
+- **The mechanism is checked in SolidCraft.** After the assembly is saved, `joint.list` gives the degrees of freedom, conflicting joints and floating chains, and each joint is driven a little and back (`joint.drive`). The report lists every joint with what it came from (geometry, Inventor, both), whether it was made, its limits and whether it moves.
 - **Repeats, patterns and symmetry are recognised.** Placements in a row, a grid or round an axis become a pattern with its spacing as a parameter. Mirror planes and mirrored part pairs are found and recorded on the design.
 - **A report** (`conversion-report.md`) says what was planned and, separately, what SolidCraft actually built: per design and per step group, every failure with SolidCraft's own error, every step left out and why, and where the time went.
 
@@ -104,7 +105,7 @@ No dependencies outside the Rust standard library: it builds offline, and the co
 ## Limits
 
 - Inventor's feature history (extrudes, holes, fillets) does not come across: parts are exact solids, and sheet metal parts are native SolidCraft sheet metal built from those solids. Rebuilding flanges as separate flange features from Inventor's flat pattern is planned (the bundle already carries the flat pattern and bend table).
-- Inferred joints are a best guess from the geometry. The report lists each one with its reason. For assemblies that matter, constrain them in Inventor and the constraints carry over exactly.
+- Inferred joints are a best guess from the geometry. The report lists each one with its reason and the Inventor constraints that agree with it. Inventor constraints carry over as SolidCraft constraints only when the exporter records their geometry completely (see `docs/architecture.md`).
 - Mirror symmetry is recorded, not enforced: SolidCraft has no mirrored-component command yet.
 
 ## Licence

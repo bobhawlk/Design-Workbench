@@ -3,7 +3,6 @@
 
 use std::collections::BTreeMap;
 
-use lcw_analyze::joints::Source;
 use lcw_analyze::Analysis;
 use lcw_json::{obj, Json};
 use lcw_solidcraft::emit::describe_pattern;
@@ -63,6 +62,7 @@ pub fn markdown(a: &Analysis, runs: &[DesignResult], probe: &[String], events: &
         s.push_str("Nothing was built (analysis or dry run): everything below is the plan.\n\n");
     } else {
         s.push_str(&result_summary(runs));
+        s.push_str(&mechanism_section(a, runs));
     }
     if !probe.is_empty() {
         s.push_str("## SolidCraft compatibility\n\n");
@@ -124,19 +124,34 @@ pub fn markdown(a: &Analysis, runs: &[DesignResult], probe: &[String], events: &
     if !a.joints.joints.is_empty() {
         s.push_str("| Joint | Type | Fixed side | Moving side | From |\n|---|---|---|---|---|\n");
         for j in &a.joints.joints {
-            let from = match &j.source {
-                Source::InventorJoint => "Inventor joint".to_string(),
-                Source::InventorConstraint => "Inventor constraint".to_string(),
-                Source::Inferred(r) => format!("geometry: {r}"),
-            };
-            s.push_str(&format!("| {} | {} | {} | {} | {} |\n", cell(&j.name), j.kind.name(), cell(&name_of(a, &j.a)), cell(&name_of(a, &j.b)), cell(&from)));
+            s.push_str(&format!("| {} | {} | {} | {} | {} |\n", cell(&j.name), j.kind.name(), cell(&name_of(a, &j.a)), cell(&name_of(a, &j.b)), cell(&j.basis())));
         }
     }
     if !a.joints.constraints.is_empty() {
-        s.push_str(&format!("\n{} Inventor constraint(s) to carry over as SolidCraft constraints.\n", a.joints.constraints.len()));
+        s.push_str(&format!("\n{} Inventor constraint(s) to carry over as SolidCraft constraints (their geometry was complete and lands on the parts' faces).\n", a.joints.constraints.len()));
     }
     if !a.joints.rigid_groups.is_empty() {
-        s.push_str(&format!("\n{} group(s) of parts to hold rigidly together (fasteners, spacers, bolted parts).\n", a.joints.rigid_groups.len()));
+        s.push_str(&format!("\n{} group(s) of parts held rigidly together:\n\n| Held to | Parts | Why |\n|---|---|---|\n", a.joints.rigid_groups.len()));
+        for g in &a.joints.rigid_groups {
+            let mut why: BTreeMap<String, usize> = BTreeMap::new();
+            for w in g.why.iter().skip(1) {
+                *why.entry(w.clone()).or_default() += 1;
+            }
+            let text: Vec<String> = why.iter().map(|(w, n)| if *n > 1 { format!("{n} × {w}") } else { w.clone() }).collect();
+            s.push_str(&format!("| {} | {} | {} |\n", cell(&name_of(a, &g.members[0])), g.members.len() - 1, cell(&text.join("; "))));
+        }
+    }
+    if !a.joints.evidence.is_empty() {
+        let ev = &a.joints.evidence;
+        let count = |p: &str| ev.iter().filter(|e| e.outcome.starts_with(p)).count();
+        s.push_str(&format!(
+            "\n### Inventor constraints used as evidence\n\n{} Inventor constraint(s) and joint(s) were not made into SolidCraft constraints, because their exported geometry is incomplete or does not land on the parts (the reason is listed). They were used as evidence: {} agree with a rigid group, {} with a joint, {} decided what a part with no joint is held to, {} were not used, {} name no part with geometry.\n\n",
+            ev.len(), count("agrees: the parts"), count("agrees: `"), count("used:"), count("not used"), count("names no part")
+        ));
+        s.push_str("| Constraint | In | Kind | Between | Why not a SolidCraft constraint | Outcome |\n|---|---|---|---|---|---|\n");
+        for e in ev {
+            s.push_str(&format!("| {} | {} | {} | {} / {} | {} | {} |\n", cell(&e.name), cell(&e.assembly), cell(&e.kind), cell(&name_of(a, &e.a)), cell(&name_of(a, &e.b)), cell(&e.why_not), cell(&e.outcome)));
+        }
     }
     let notes: Vec<&String> = a.notes.iter().chain(m.warnings.iter()).collect();
     if !notes.is_empty() {
@@ -196,6 +211,90 @@ fn result_summary(runs: &[DesignResult]) -> String {
     }
     s.push('\n');
     s
+}
+
+/// Per joint: where it came from, whether SolidCraft made it, its limits, and whether the check
+/// could drive it; then the mechanism's degrees of freedom, conflicts and floating chains.
+fn mechanism_section(a: &Analysis, runs: &[DesignResult]) -> String {
+    let Some(asm) = runs.last() else { return String::new() };
+    let mut s = String::from("## Mechanism\n\n");
+    let check = asm.steps.iter().find(|x| x.op == "verify_joints");
+    let data = check.map(|c| c.data.clone()).unwrap_or_default();
+    let checked = data.get("joints").and_then(Json::as_array).map(<[Json]>::to_vec).unwrap_or_default();
+    match check.map(|c| &c.status) {
+        Some(Status::Done) => s.push_str(&format!("SolidCraft's check of the saved assembly: {}.\n\n", check.map_or("", |c| c.note.as_str()))),
+        Some(st) => s.push_str(&format!("The mechanism check did not run to the end ({}: {}).\n\n", st.name(), st.detail())),
+        None => s.push_str("The mechanism check was not run.\n\n"),
+    }
+    if !a.joints.joints.is_empty() {
+        s.push_str("| Joint | Type | From | Made | Limits | Check |\n|---|---|---|---|---|---|\n");
+    }
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    let total: BTreeMap<&str, usize> = a.joints.joints.iter().fold(BTreeMap::new(), |mut m, j| {
+        *m.entry(j.name.as_str()).or_insert(0) += 1;
+        m
+    });
+    for j in &a.joints.joints {
+        let k = seen.entry(j.name.as_str()).or_insert(0);
+        *k += 1;
+        let name = if total[j.name.as_str()] > 1 { format!("{} {}", j.name, k) } else { j.name.clone() };
+        let made = asm.steps.iter().find(|x| x.group == "joints" && x.label.starts_with(&format!("{} {} (", j.kind.name(), name)));
+        let made_text = match made.map(|x| &x.status) {
+            Some(Status::Done) => "yes".to_string(),
+            Some(st) => format!("{}: {}", st.name(), st.detail()),
+            None => "not attempted (see notes)".to_string(),
+        };
+        let lim = asm.steps.iter().find(|x| x.op == "auto_limits" && x.label == format!("limit {name}"));
+        let c = checked.iter().find(|c| c.str_of("joint") == Some(name.as_str()));
+        let lim_text = match (c.and_then(|c| c.get("limits")).and_then(Json::as_array), lim.map(|x| &x.status)) {
+            (Some(l), _) if l.len() == 2 => format!("{} to {} {}", fmt_num(l[0].as_f64()), fmt_num(l[1].as_f64()), c.and_then(|c| c.str_of("unit")).unwrap_or("")),
+            (_, Some(Status::Skipped(w))) => w.clone(),
+            (_, Some(st)) if !st.achieved() => format!("{}: {}", st.name(), st.detail()),
+            _ => "none".to_string(),
+        };
+        let check_text = match c {
+            Some(c) => {
+                let mut t = c.str_of("result").unwrap_or("").to_string();
+                if let Some(w) = c.str_of("why") {
+                    t.push_str(&format!(": {w}"));
+                }
+                if let Some(l) = c.get("stopped_by_loop").and_then(|l| l.str_of("joint")) {
+                    t.push_str(&format!(" (a loop through `{l}` stops it)"));
+                }
+                t
+            }
+            None => "-".to_string(),
+        };
+        s.push_str(&format!("| {} | {} | {} | {} | {} | {} |\n", cell(&name), j.kind.name(), cell(&j.basis()), cell(&made_text), cell(&lim_text), cell(&check_text)));
+    }
+    let list = |k: &str| data.get(k).and_then(Json::as_array).map(<[Json]>::to_vec).unwrap_or_default();
+    let conflicts = list("conflicts");
+    if !conflicts.is_empty() {
+        s.push_str("\nConflicting joints (SolidCraft cannot place everything they ask for at once):\n\n");
+        for c in &conflicts {
+            s.push_str(&format!("- `{}`: {}\n", c.str_of("joint").unwrap_or("?"), c.str_of("why").unwrap_or("")));
+        }
+    }
+    for e in list("errors") {
+        s.push_str(&format!("- joint error: `{}`: {}\n", e.str_of("joint").unwrap_or("?"), e.str_of("why").unwrap_or("")));
+    }
+    let floating = list("floating");
+    if !floating.is_empty() {
+        s.push_str("\nFloating (joined to nothing grounded, so SolidCraft does not place them):\n\n");
+        for f in &floating {
+            let occ: Vec<String> = f.get("occurrences").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|o| o.as_str().map(str::to_string)).collect();
+            s.push_str(&format!("- {}\n", cell(&occ.join(", "))));
+        }
+    }
+    s.push('\n');
+    s
+}
+
+fn fmt_num(v: Option<f64>) -> String {
+    match v {
+        Some(x) => format!("{:.2}", x),
+        None => "?".into(),
+    }
 }
 
 fn indent_block(text: &str) -> String {
@@ -322,6 +421,7 @@ pub fn builds_json(runs: &[DesignResult]) -> Json {
                         let mut j = obj!{"step" => s.label.as_str(), "group" => s.group.as_str(), "op" => s.op.as_str(), "command" => s.command.as_str(), "status" => s.status.name(), "detail" => s.status.detail(), "ms" => (s.ms * 10.0).round() / 10.0, "calls" => s.calls};
                         if !s.note.is_empty() { j.set("note", s.note.as_str()); }
                         if s.batched { j.set("batched", true); }
+                        if !s.data.is_null() { j.set("data", s.data.clone()); }
                         j
                     }).collect()),
                 }
@@ -336,7 +436,8 @@ pub fn json(a: &Analysis, runs: &[DesignResult], events: &[String]) -> Json {
         "schema" => "lcw-report/2",
         "source" => m.source_file.as_str(),
         "sheets" => Json::Arr(a.sheets.iter().map(|(d, sp)| obj!{"part" => m.defs[*d].name.as_str(), "rule" => sp.rule.as_str(), "thickness" => sp.thickness, "bend_radius" => sp.bend_radius, "k_factor" => sp.k_factor, "k_assumed" => sp.k_assumed, "bends" => sp.bends.len()}).collect()),
-        "joints" => Json::Arr(a.joints.joints.iter().map(|j| obj!{"name" => j.name.as_str(), "type" => j.kind.name(), "a" => name_of(a, &j.a), "b" => name_of(a, &j.b), "origin" => Json::from(j.origin.to_array()), "axis" => Json::from(j.z.to_array())}).collect()),
+        "joints" => Json::Arr(a.joints.joints.iter().map(|j| obj!{"name" => j.name.as_str(), "type" => j.kind.name(), "a" => name_of(a, &j.a), "b" => name_of(a, &j.b), "origin" => Json::from(j.origin.to_array()), "axis" => Json::from(j.z.to_array()), "basis" => j.basis(), "evidence" => j.evidence.clone()}).collect()),
+        "evidence" => Json::Arr(a.joints.evidence.iter().map(|e| obj!{"name" => e.name.as_str(), "assembly" => e.assembly.as_str(), "kind" => e.kind.as_str(), "a" => name_of(a, &e.a), "b" => name_of(a, &e.b), "why_not" => e.why_not.as_str(), "outcome" => e.outcome.as_str()}).collect()),
         "patterns" => Json::Arr(a.patterns.iter().map(|p| obj!{"name" => p.name.as_str(), "kind" => describe_pattern(&p.found.kind), "members" => p.found.members.len()}).collect()),
         "notes" => a.notes.clone(),
         "events" => events.to_vec(),
@@ -349,7 +450,7 @@ mod tests {
     use super::*;
 
     fn step(label: &str, group: &str, op: &str, status: Status) -> StepResult {
-        StepResult { label: label.into(), group: group.into(), op: op.into(), status, command: format!("cmd.{op}"), ms: 1500.0, calls: 1, batched: false, note: String::new() }
+        StepResult { label: label.into(), group: group.into(), op: op.into(), status, command: format!("cmd.{op}"), ms: 1500.0, calls: 1, batched: false, note: String::new(), data: lcw_json::Json::Null }
     }
 
     #[test]
