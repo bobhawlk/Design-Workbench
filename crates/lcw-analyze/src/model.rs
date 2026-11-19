@@ -73,7 +73,37 @@ pub fn clean_name(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Inventor's up axis is +Y, SolidCraft's +Z: a quarter turn about X (+90 degrees) takes one to
+/// the other (Y to Z, Z to -Y), and Inventor's front view (looking along -Z) becomes SolidCraft's
+/// (looking along +Y). The same turn SolidCraft offers when a Y-up file opens.
+pub const Y_UP_TO_Z_UP: M4 = M4([[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]);
+
 impl Model {
+    /// Turn the whole assembly by `r` about the root's origin: the root's own placements, and
+    /// the geometry its constraints and joints carry (in the root's coordinates), are turned;
+    /// everything below follows. Every world quantity the analysis finds is then in the turned
+    /// frame.
+    pub fn turn_root(&mut self, r: &M4) {
+        let root = &mut self.defs[self.root];
+        for o in &mut root.occurrences {
+            o.transform = *r * o.transform;
+        }
+        for c in &mut root.constraints {
+            for e in [&mut c.a, &mut c.b] {
+                e.point = r.point(e.point);
+                e.dir = e.dir.map(|d| r.dir(d));
+                e.rim_point = e.rim_point.map(|p| r.point(p));
+            }
+        }
+        for j in &mut root.joints {
+            for side in [&mut j.a, &mut j.b] {
+                side.origin = r.point(side.origin);
+                side.z = r.dir(side.z);
+                side.x = side.x.map(|x| r.dir(x));
+            }
+        }
+    }
+
     /// Every placement below the root (the root itself excluded), suppressed ones left out.
     pub fn instances(&self) -> Vec<Inst> {
         let mut out = Vec::new();
@@ -358,5 +388,36 @@ impl KeyMaker {
         } else {
             format!("{base} ({n})")
         }
+    }
+}
+
+#[cfg(test)]
+mod turn_tests {
+    use super::*;
+    use lcw_geom::{v3, V3};
+
+    #[test]
+    fn standing_up_turns_y_to_z_and_the_front_to_the_front() {
+        // An invented assembly: a sub-assembly 10 mm up (+Y) holding a part 5 mm toward the
+        // viewer (+Z), and a constraint plane in the root facing up.
+        let mut m = Model { root: 0, ..Model::default() };
+        let mut root = Def { name: "top".into(), assembly: true, ..Def::default() };
+        root.occurrences.push(Occ { id: "sub:1".into(), name: "sub:1".into(), def: 1, transform: M4::translation(v3(0.0, 10.0, 0.0)), grounded: false, suppressed: false, visible: true, pattern: None });
+        let mut c = Constraint::default();
+        c.a.point = v3(1.0, 2.0, 3.0);
+        c.a.dir = Some(V3::Y);
+        root.constraints.push(c);
+        let mut sub = Def { name: "sub".into(), assembly: true, ..Def::default() };
+        sub.occurrences.push(Occ { id: "p:1".into(), name: "p:1".into(), def: 2, transform: M4::translation(v3(0.0, 0.0, 5.0)), grounded: false, suppressed: false, visible: true, pattern: None });
+        m.defs = vec![root, sub, Def { name: "p".into(), ..Def::default() }];
+        m.turn_root(&Y_UP_TO_Z_UP);
+        let w = m.instances().iter().find(|x| x.path == [0, 0]).unwrap().world;
+        // Up 10 is +Z 10; toward the viewer (Inventor +Z) is SolidCraft's -Y (the front view looks along +Y).
+        assert!((w.origin() - v3(0.0, -5.0, 10.0)).norm() < 1e-12, "{:?}", w.origin());
+        let c = &m.defs[0].constraints[0];
+        assert!((c.a.point - v3(1.0, -3.0, 2.0)).norm() < 1e-12);
+        assert!((c.a.dir.unwrap() - V3::Z).norm() < 1e-12);
+        // The sub-assembly's own contents are not turned twice.
+        assert_eq!(m.defs[1].occurrences[0].transform, M4::translation(v3(0.0, 0.0, 5.0)));
     }
 }

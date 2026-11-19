@@ -15,6 +15,7 @@ pub fn json(r: &Report, tol: &Tol) -> Json {
         "built" => r.built.as_str(),
         "assembly" => r.assembly.as_str(),
         "solidcraft" => r.solidcraft.as_str(),
+        "root_turn" => r.root_turn.as_str(),
         "seconds" => r.seconds,
         "tolerances" => obj! {
             "position_mm" => tol.pos_mm, "position_rel_of_diagonal" => tol.pos_rel, "angle_deg" => tol.angle_deg,
@@ -34,13 +35,13 @@ pub fn json(r: &Report, tol: &Tol) -> Json {
 pub fn markdown(r: &Report, tol: &Tol) -> String {
     let mut s = String::new();
     s.push_str(&format!("# Verification: {}\n\n", if r.failed() { "FAILED" } else { "passed" }));
-    s.push_str(&format!("Bundle `{}`  \nBuilt assembly `{}`  \nSolidCraft {}  \nChecked in {:.0} s.\n\n", r.bundle, r.assembly, r.solidcraft, r.seconds));
+    s.push_str(&format!("Bundle `{}`  \nBuilt assembly `{}`  \nSolidCraft {}  \nRoot turn: {}  \nChecked in {:.0} s.\n\n", r.bundle, r.assembly, r.solidcraft, r.root_turn, r.seconds));
     s.push_str("| # | Check | Result |\n|---|---|---|\n");
     for c in &r.checks {
         s.push_str(&format!("| {} | {} | **{}** {} |\n", c.id, c.title, c.status.name(), one_line(&c.summary)));
     }
     s.push_str(&format!(
-        "\n## How it is checked\n\nSolidCraft is asked what it holds; the bundle says what Inventor had; the two are compared here. Expected world placements are the products of the bundle's occurrence matrices down each path (computed here, not taken from the converter). Units: the bundle is in millimetres and degrees, SolidCraft reports mm, mm3 and g mm2, so no unit conversion is applied; a systematic volume factor would be reported as a units problem.\n\nTolerances: position {} mm or {} of the part's diagonal, whichever is larger; frame angle {} deg; inertia per unit mass {}%; volume {}% against SolidCraft's own import of the STEP and {}% against Inventor's; box {} mm against the import, {} mm or {}% of the diagonal against Inventor's range box (which is not tight on curved parts); an interference is suspect from {}% of the smaller body.\n\n",
+        "\n## How it is checked\n\nSolidCraft is asked what it holds; the bundle says what Inventor had; the two are compared here. Expected world placements are the products of the bundle's occurrence matrices down each path (computed here, not taken from the converter), turned by the root turn above when convert stood the assembly upright. Units: the bundle is in millimetres and degrees, SolidCraft reports mm, mm3 and g mm2, so no unit conversion is applied; a systematic volume factor would be reported as a units problem.\n\nTolerances: position {} mm or {} of the part's diagonal, whichever is larger; frame angle {} deg; inertia per unit mass {}%; volume {}% against SolidCraft's own import of the STEP and {}% against Inventor's; box {} mm against the import, {} mm or {}% of the diagonal against Inventor's range box (which is not tight on curved parts); an interference is suspect from {}% of the smaller body.\n\n",
         tol.pos_mm, tol.pos_rel, tol.angle_deg, tol.inertia_rel * 100.0, tol.volume_rel * 100.0, tol.bundle_volume_rel * 100.0, tol.bbox_mm, tol.bundle_bbox_mm, tol.bundle_bbox_rel * 100.0, tol.interference_fail_fraction * 100.0
     ));
     for c in &r.checks {

@@ -67,6 +67,8 @@
              "joints": "/joints", "joint_name": "name", "joint_values": "values", "value": "value", "value_limits": "limits", "value_unit": "unit"},
     "guard": {"about": "A step with a guard (constraints and joints) is undone with the `undo` op when it moves a guarded placement: `occurrence_props` before and after, compared by these pointers within tol_mm.",
               "points": ["/total/center_of_mass", "/total/bbox/min", "/total/bbox/max"], "tol_mm": 0.01},
+    "volume_guard": {"about": "A step that must keep the design's volume (a sheet metal conversion) is undone with `undo` when the closed bodies' total volume, read with `op` at this pointer before and after, changes by more than tol_rel.",
+                     "op": "list_bodies", "volume": "/total/volume_mm3", "tol_rel": 0.01},
     "drive": {"moved": "/moved", "reason": "/reason", "values": "/values", "stopped_by_loop": "/stopped_by_loop", "stopped_by_contact": "/stopped_by_contact", "conflicts": "/conflicts"}
   },
   "limits": {

@@ -5,7 +5,7 @@
 //! `--profile`), and `inv2sc probe` checks the profile against the running SolidCraft's own
 //! command catalogue and schemas before anything is built.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use std::time::Duration;
 
@@ -29,6 +29,9 @@ pub struct Op {
     pub drop_point: Option<DropPoint>,
     /// How long one call of this op may take (`timeout_s`), when it is known to be slow.
     pub timeout: Option<Duration>,
+    /// Parameters (inv2sc's names) the running SolidCraft no longer lists: left out of every
+    /// call for this run (filled by [`Profile::check`]).
+    pub dropped: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,7 +174,7 @@ impl Profile {
             let drop_point = o.get("retry_dropping_point").and_then(|r| {
                 Some(DropPoint { param: r.str_of("param")?.to_string(), when: r.arr_of("when").iter().filter_map(|x| x.as_str().map(str::to_string)).collect() })
             });
-            ops.insert(name.clone(), Op { command, tool, params, drop_point, timeout: seconds(o.get("timeout_s")) });
+            ops.insert(name.clone(), Op { command, tool, params, drop_point, timeout: seconds(o.get("timeout_s")), dropped: BTreeSet::new() });
         }
         let fallbacks = j
             .get("fallbacks")
@@ -218,7 +221,7 @@ impl Profile {
         let o = self.ops.get(op)?;
         let mut out = Json::obj();
         for (k, v) in params.as_object().unwrap_or(&[]) {
-            if v.is_null() {
+            if v.is_null() || o.dropped.contains(k) {
                 continue;
             }
             let name = o.params.get(k).cloned().unwrap_or_else(|| k.clone());
@@ -232,29 +235,34 @@ impl Profile {
     /// reason, so the build falls back or reports instead of failing half way.
     pub fn check(&mut self, catalog: &Catalog) -> Vec<String> {
         let mut report = Vec::new();
-        for (name, op) in &self.ops {
+        let mut gone = Vec::new();
+        for (name, op) in self.ops.iter_mut() {
             if op.tool.is_some() {
                 continue;
             }
             match catalog.commands.get(&op.command) {
                 None => {
-                    self.disabled.insert(name.clone(), format!("SolidCraft has no command `{}`", op.command));
+                    gone.push((name.clone(), format!("SolidCraft has no command `{}`", op.command)));
                 }
                 Some(info) if !info.enabled => {
                     report.push(format!("{name}: `{}` is disabled right now ({})", op.command, info.reason.clone().unwrap_or_default()));
                 }
                 Some(info) => {
-                    let missing: Vec<&String> = op.params.values().filter(|p| !info.knows_param(p)).collect();
+                    // A parameter the command no longer lists is left out of this run's calls
+                    // (sending it would fail the whole step); the rest of the op still runs.
+                    let missing: Vec<(String, String)> = op.params.iter().filter(|(_, p)| !info.knows_param(p)).map(|(k, p)| (k.clone(), p.clone())).collect();
                     if !missing.is_empty() && info.schema_params.is_some() {
                         report.push(format!(
-                            "{name}: `{}` does not list parameter(s) {} any more; check the profile",
+                            "{name}: `{}` does not list parameter(s) {} any more; left out of this run (the rest of the step runs; update the profile)",
                             op.command,
-                            missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ")
+                            missing.iter().map(|(_, m)| format!("`{m}`")).collect::<Vec<_>>().join(", ")
                         ));
+                        op.dropped.extend(missing.into_iter().map(|(k, _)| k));
                     }
                 }
             }
         }
+        self.disabled.extend(gone);
         for (name, why) in &self.disabled {
             let alt = self.fallbacks.get(name).and_then(|f| f.iter().find(|a| self.ops.contains_key(*a) && !self.disabled.contains_key(*a)));
             report.push(match alt {
@@ -373,6 +381,26 @@ mod tests {
         assert!(report.iter().any(|r| r.starts_with("constraint:") && r.contains("skipped")), "{report:?}");
         assert_eq!(p.resolve("constraint"), None);
         assert_eq!(p.resolve("place"), Some("place"));
+    }
+
+    #[test]
+    fn a_parameter_the_command_no_longer_lists_is_left_out_with_one_note() {
+        let mut p = Profile::builtin();
+        let mut cat = Catalog::default();
+        for op in p.ops.values() {
+            cat.commands.insert(op.command.clone(), CommandInfo { enabled: true, ..Default::default() });
+        }
+        let cm = p.ops["component_metadata"].command.clone();
+        let mut listed: Vec<String> = p.ops["component_metadata"].params.values().cloned().collect();
+        listed.retain(|x| x != "material");
+        cat.commands.insert(cm.clone(), CommandInfo { enabled: true, schema_params: Some(listed), ..Default::default() });
+        let report = p.check(&cat);
+        let notes: Vec<&String> = report.iter().filter(|r| r.contains("material")).collect();
+        assert_eq!(notes.len(), 1, "{report:?}");
+        assert!(notes[0].contains("left out of this run"), "{}", notes[0]);
+        assert!(p.available("component_metadata"));
+        let (_, params) = p.call("component_metadata", obj! {"component" => 3.0, "material" => "Steel", "part_number" => "X"}).unwrap();
+        assert!(params.get("material").is_none() && params.get("part_number").is_some(), "{params:?}");
     }
 
     #[test]

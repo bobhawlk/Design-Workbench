@@ -290,6 +290,10 @@ fn good_nodes() -> Vec<Node> {
 }
 
 fn verify(name: &str, nodes: &[Node], scale: BTreeMap<String, f64>, clash: Json, edit: impl Fn(&mut Bundle)) -> lcw_verify::Report {
+    verify_turned(name, nodes, scale, clash, edit, M4::IDENTITY)
+}
+
+fn verify_turned(name: &str, nodes: &[Node], scale: BTreeMap<String, f64>, clash: Json, edit: impl Fn(&mut Bundle), root_turn: M4) -> lcw_verify::Report {
     let dir = tmp(name);
     let mut b = bundle();
     edit(&mut b);
@@ -302,7 +306,31 @@ fn verify(name: &str, nodes: &[Node], scale: BTreeMap<String, f64>, clash: Json,
     let profile = Profile::builtin();
     let mut s = Session::new(&mut fake, &profile, Duration::from_secs(60));
     let log = |_: &str| {};
-    run(&mut s, &Inputs { bundle: &b, built: &PathBuf::from("/built"), assembly: &PathBuf::from("/built/asm.sc"), tol: Tol::default(), log: &log }).unwrap()
+    run(&mut s, &Inputs { bundle: &b, built: &PathBuf::from("/built"), assembly: &PathBuf::from("/built/asm.sc"), tol: Tol::default(), root_turn, root_turn_note: "test".into(), log: &log }).unwrap()
+}
+
+/// The build stood upright: every top placement turned by `r`.
+fn turned(nodes: &[Node], r: M4) -> Vec<Node> {
+    nodes
+        .iter()
+        .map(|n| match n {
+            Node::Part(o, p, m) => Node::Part(o, p, r * *m),
+            Node::Asm(o, p, m, c) => Node::Asm(o, p, r * *m, c.clone()),
+        })
+        .collect()
+}
+
+#[test]
+fn a_build_stood_upright_is_judged_through_the_turn_it_states() {
+    use lcw_verify::expect::Y_UP;
+    let nodes = turned(&good_nodes(), Y_UP);
+    let r = verify_turned("upright", &nodes, BTreeMap::new(), no_clash(), |_| {}, Y_UP);
+    let c2 = r.check(2).unwrap();
+    assert_eq!(c2.status, Status::Pass, "{:?}", c2.details);
+    assert_eq!(r.check(4).unwrap().status, Status::Pass, "{}", r.check(4).unwrap().summary);
+    // Without the turn every top placement is a quarter turn out.
+    let r = verify_turned("upright-unstated", &nodes, BTreeMap::new(), no_clash(), |_| {}, M4::IDENTITY);
+    assert_eq!(r.check(2).unwrap().status, Status::Fail);
 }
 
 fn no_clash() -> Json {
@@ -388,6 +416,28 @@ fn a_part_whose_design_differs_from_its_step_is_placed_right_and_named_by_the_pa
     let c2 = r.check(2).unwrap();
     assert_eq!(c2.data.f64_of("misplaced"), Some(1.0), "{:?}", c2.details);
     assert!(c2.details.join("\n").contains("MISPLACED Block:1"), "{:?}", c2.details);
+}
+
+#[test]
+fn a_sheet_metal_part_rebuilt_a_little_differently_is_explained_and_a_solid_is_not() {
+    let mut scale = BTreeMap::new();
+    scale.insert("Block".to_string(), 1.002);
+    let sheet = |b: &mut Bundle| {
+        for d in &mut b.documents {
+            if d.name == "Block" {
+                d.sheet_metal = Some(lcw_bundle::SheetMetal { thickness: 4.0, ..Default::default() });
+            }
+        }
+    };
+    let r = verify("sheet-explained", &good_nodes(), scale.clone(), no_clash(), sheet);
+    let c1 = r.check(1).unwrap();
+    assert_eq!(c1.status, Status::Pass, "{}\n{:?}", c1.summary, c1.details);
+    assert!(c1.summary.contains("1 sheet metal conversion difference, explained"), "{}", c1.summary);
+    // The same difference on a part Inventor has as a solid is the converter's.
+    let r = verify("solid-not-explained", &good_nodes(), scale, no_clash(), |_| {});
+    let c1 = r.check(1).unwrap();
+    assert_eq!(c1.status, Status::Fail);
+    assert!(c1.details.join("\n").contains("Block [converter error"), "{:?}", c1.details);
 }
 
 #[test]

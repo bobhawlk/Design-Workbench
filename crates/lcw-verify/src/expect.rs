@@ -36,9 +36,19 @@ pub struct Expected {
 }
 
 pub fn expand(b: &Bundle) -> Result<Expected, String> {
+    expand_turned(b, &M4::IDENTITY)
+}
+
+/// Inventor's Y up as SolidCraft's Z up: +90 degrees about X (y to z, z to -y). Written out here,
+/// not taken from the converter.
+pub const Y_UP: M4 = M4([[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]);
+
+/// The bundle's placements in SolidCraft's world when the build turned the root by `root`
+/// (SolidCraft's world = root × Inventor's world).
+pub fn expand_turned(b: &Bundle, root_turn: &M4) -> Result<Expected, String> {
     let root = b.root_doc().ok_or_else(|| format!("the bundle's root `{}` is not a document", b.root))?;
     let mut e = Expected::default();
-    walk(b, root, &M4::IDENTITY, &[], &mut e, 0);
+    walk(b, root, root_turn, &[], &mut e, 0);
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for i in &e.insts {
         if !i.is_assembly && !i.has_step {

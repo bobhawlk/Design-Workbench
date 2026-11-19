@@ -5,11 +5,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use lcw_bundle::{Bundle, DocKind, Document};
-use lcw_geom::{Bbox, V3};
+use lcw_geom::{Bbox, M4, V3};
 use lcw_json::{obj, Json};
 
 use crate::assign::{assign, FORBIDDEN};
-use crate::expect::{expand, ExpInst, Expected};
+use crate::expect::{expand_turned, ExpInst, Expected};
 use crate::judge::{frame_delta, judge, rel_diff, transformed_box, Judged, Tol};
 use crate::obs::{design_root, measure_design, name_root, parse_links, step_vertices, Geo, Inst, Measured, Tree};
 use crate::session::Session;
@@ -48,6 +48,8 @@ pub struct Report {
     pub built: String,
     pub assembly: String,
     pub solidcraft: String,
+    /// The turn the expected placements were put through (what convert did to the root).
+    pub root_turn: String,
     pub checks: Vec<Check>,
     /// Things that could not be checked, and why.
     pub limits: Vec<String>,
@@ -75,6 +77,10 @@ pub struct Inputs<'a> {
     /// The assembly design to check.
     pub assembly: &'a Path,
     pub tol: Tol,
+    /// The turn convert put on the root (SolidCraft's world = this × Inventor's), and how it
+    /// is known, for the report.
+    pub root_turn: M4,
+    pub root_turn_note: String,
     /// Progress lines.
     pub log: &'a dyn Fn(&str),
 }
@@ -136,8 +142,8 @@ pub fn run(s: &mut Session, inp: &Inputs) -> Result<Report, String> {
     let bundle = inp.bundle;
     let tol = &inp.tol;
     let log = inp.log;
-    let expected: Expected = expand(bundle)?;
-    let mut report = Report { bundle: bundle.folder.as_ref().map(|f| f.display().to_string()).unwrap_or_default(), built: inp.built.display().to_string(), assembly: inp.assembly.display().to_string(), ..Report::default() };
+    let expected: Expected = expand_turned(bundle, &inp.root_turn)?;
+    let mut report = Report { bundle: bundle.folder.as_ref().map(|f| f.display().to_string()).unwrap_or_default(), built: inp.built.display().to_string(), assembly: inp.assembly.display().to_string(), root_turn: inp.root_turn_note.clone(), ..Report::default() };
     if let Ok(v) = s.t.call("version", Json::obj()) {
         report.solidcraft = format!("{} ({})", v.str_of("version").unwrap_or("?"), v.str_of("mode").unwrap_or("?"));
     }
@@ -373,14 +379,67 @@ fn limits(bundle: &Bundle, expected: &Expected, parts: &BTreeMap<String, PartDat
     l
 }
 
+/// Why a part design differs, as the part check reads it. Only some are failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cause {
+    /// The built design differs from SolidCraft's own import of the part's STEP, more than sheet
+    /// metal rebuilt at Inventor's thickness explains: the converter changed the part.
+    Converter,
+    /// Sheet metal rebuilt from the solid at Inventor's thickness: within 1% of the volume and
+    /// the thickness of the box and centre of mass of the import. Not a failure.
+    SheetMetal,
+    /// SolidCraft's own import of the STEP leaves a body open (faces it could not build), so the
+    /// part has no volume where Inventor has one: the built part is incomplete, but the
+    /// converter built what SolidCraft makes of the file.
+    Import,
+    /// The part has hidden bodies (not in the STEP) or several bodies, and the difference from
+    /// Inventor's figures is what those account for. Not a failure.
+    Bodies,
+    /// Only Inventor's range box differs, and it is larger than the part on every axis: the range
+    /// box is not tight on curved faces. Not a failure.
+    RangeBox,
+    /// The built design matches its STEP, but the STEP does not match Inventor's figures: the
+    /// export is short of something (a body, a feature).
+    Export,
+}
+
+impl Cause {
+    fn name(self) -> &'static str {
+        match self {
+            Cause::Converter => "converter error",
+            Cause::SheetMetal => "sheet metal conversion difference",
+            Cause::Import => "SolidCraft's STEP import",
+            Cause::Bodies => "hidden-body or multi-body effect",
+            Cause::RangeBox => "Inventor's range box",
+            Cause::Export => "export differs from Inventor",
+        }
+    }
+    fn fails(self) -> bool {
+        matches!(self, Cause::Converter | Cause::Import | Cause::Export)
+    }
+}
+
+/// The share of its volume a sheet metal part may change by when rebuilt from the solid.
+const SHEET_VOLUME_REL: f64 = 0.01;
+
 fn check_parts(bundle: &Bundle, part_docs: &[&Document], parts: &BTreeMap<String, PartData>, file_of_doc: &BTreeMap<String, String>, tol: &Tol) -> Check {
     let mut details = Vec::new();
+    let mut explained_details = Vec::new();
     let mut rows = Vec::new();
     let (mut ok, mut failed, mut skipped, mut with_bundle) = (0usize, 0usize, 0usize, 0usize);
+    let mut by_cause: BTreeMap<&'static str, (usize, bool)> = BTreeMap::new();
     let mut ratios: Vec<f64> = Vec::new();
     for d in part_docs {
         let p = &parts[&d.id];
-        let mut problems: Vec<String> = Vec::new();
+        // Against SolidCraft's import of the STEP, and against Inventor's own figures.
+        let mut vs_step: Vec<String> = Vec::new();
+        let mut vs_inventor: Vec<String> = Vec::new();
+        // Anything else that keeps the part from being checked.
+        let mut other: Vec<String> = Vec::new();
+        let (mut vol_rel_step, mut box_off, mut com_off) = (0.0f64, 0.0f64, 0.0f64);
+        let mut box_only_larger_inventor = true;
+        let mut inv_volume_rel: Option<f64> = None;
+        let mut built_volume: Option<f64> = None;
         let mut row = obj! {"part" => d.name.as_str(), "design" => p.built_file.clone()};
         if p.no_solid {
             skipped += 1;
@@ -389,54 +448,61 @@ fn check_parts(bundle: &Bundle, part_docs: &[&Document], parts: &BTreeMap<String
             continue;
         }
         if let Some(e) = &p.reference.error {
-            problems.push(format!("SolidCraft could not read the bundle's STEP: {e}"));
+            other.push(format!("SolidCraft could not read the bundle's STEP: {e}"));
         }
         match (&p.built_file, &p.built) {
-            (None, _) => problems.push("no saved design found (it is not linked into the assembly and there is no parts/<name>.sc)".into()),
+            (None, _) => other.push("no saved design found (it is not linked into the assembly and there is no parts/<name>.sc)".into()),
             (Some(f), Some(m)) => {
                 if let Some(e) = &m.error {
-                    problems.push(format!("the design {f} cannot be opened or measured: {e}"));
+                    other.push(format!("the design {f} cannot be opened or measured: {e}"));
                 } else if let (Some(bg), Some(rg)) = (&m.geo, &p.reference.geo) {
+                    built_volume = bg.volume;
                     row.set("built_volume_mm3", bg.volume);
                     row.set("step_volume_mm3", rg.volume);
+                    row.set("import_open_bodies", rg.open_bodies);
                     if let (Some(bv), Some(rv)) = (bg.volume, rg.volume) {
                         let r = rel_diff(bv, rv);
+                        vol_rel_step = r;
                         row.set("volume_rel_vs_step", r);
                         if rv > 0.0 {
                             ratios.push(bv / rv);
                         }
                         if r > tol.volume_rel {
-                            problems.push(format!("volume {} mm3 against {} mm3 from its STEP: {:.3}% off", fmt(bv), fmt(rv), r * 100.0));
+                            vs_step.push(format!("volume {} mm3 against {} mm3 from its STEP: {:.3}% off", fmt(bv), fmt(rv), r * 100.0));
                         }
                     } else if bg.volume.is_some() != rg.volume.is_some() {
-                        problems.push("one of the built design and its STEP is a closed solid and the other is not".into());
+                        vol_rel_step = 1.0;
+                        vs_step.push("one of the built design and its STEP is a closed solid and the other is not".into());
                     }
                     if let (Some(bb), Some(rb)) = (bg.bbox, rg.bbox) {
                         let dmax = (bb.min - rb.min).norm().max((bb.max - rb.max).norm());
+                        box_off = dmax;
                         row.set("bbox_offset_mm", dmax);
                         row.set("built_bbox", box_json(&bb));
                         let ds = (bb.size() - rb.size()).norm();
                         if dmax > tol.bbox_mm.max(1e-5 * rb.diagonal()) {
-                            problems.push(format!("box corners {} mm from the STEP's (size differs by {} mm)", fmt(dmax), fmt(ds)));
+                            vs_step.push(format!("box corners {} mm from the STEP's (size differs by {} mm)", fmt(dmax), fmt(ds)));
                         }
                     }
                     // Where its mass is: a converted part that differs from its STEP moves it.
                     if let (Some(bc), Some(rc)) = (bg.com, rg.com) {
-                        let d = bc.dist(rc);
-                        row.set("com_offset_mm", d);
+                        let dc = bc.dist(rc);
+                        com_off = dc;
+                        row.set("com_offset_mm", dc);
                         let diag = rg.bbox.map_or(0.0, |b| b.diagonal());
-                        if d > tol.pos_mm.max(tol.pos_rel * diag) {
-                            problems.push(format!("centre of mass {} mm from the STEP's (the placement check compares placed parts with this design, so this is not counted as a misplacement)", fmt(d)));
+                        if dc > tol.pos_mm.max(tol.pos_rel * diag) {
+                            vs_step.push(format!("centre of mass {} mm from the STEP's (the placement check compares placed parts with this design, so this is not counted as a misplacement)", fmt(dc)));
                         }
                     }
                     // Against what Inventor reported.
                     if let (Some(bv), Some(mv)) = (bg.volume, d.mass.volume_mm3) {
                         with_bundle += 1;
                         let r = rel_diff(bv, mv);
+                        inv_volume_rel = Some(r);
                         row.set("bundle_volume_mm3", mv);
                         row.set("volume_rel_vs_inventor", r);
                         if r > tol.bundle_volume_rel {
-                            problems.push(format!("volume {} mm3 against Inventor's {} mm3: {:.2}% off", fmt(bv), fmt(mv), r * 100.0));
+                            vs_inventor.push(format!("volume {} mm3 against Inventor's {} mm3: {:.2}% off", fmt(bv), fmt(mv), r * 100.0));
                         }
                     }
                     if let (Some(bb), Some(lo), Some(hi)) = (bg.bbox, d.mass.bbox_min, d.mass.bbox_max) {
@@ -444,9 +510,11 @@ fn check_parts(bundle: &Bundle, part_docs: &[&Document], parts: &BTreeMap<String
                         let slack = tol.bundle_bbox_mm.max(tol.bundle_bbox_rel * ib.diagonal());
                         let ds = (bb.size() - ib.size()).norm();
                         row.set("bbox_size_delta_vs_inventor_mm", ds);
-                        let per_axis = [(bb.size().x - ib.size().x).abs(), (bb.size().y - ib.size().y).abs(), (bb.size().z - ib.size().z).abs()];
-                        if per_axis.iter().any(|x| *x > slack) {
-                            problems.push(format!("box size {:?} against Inventor's range box {:?} (slack {} mm)", bb.size().to_array().map(|x| (x * 100.0).round() / 100.0), ib.size().to_array().map(|x| (x * 100.0).round() / 100.0), fmt(slack)));
+                        let (bs, is) = (bb.size().to_array(), ib.size().to_array());
+                        if (0..3).any(|i| (bs[i] - is[i]).abs() > slack) {
+                            // Larger than the part on every axis where it differs: an outer bound.
+                            box_only_larger_inventor = (0..3).all(|i| bs[i] <= is[i] + slack);
+                            vs_inventor.push(format!("box size {:?} against Inventor's range box {:?} (slack {} mm)", bs.map(|x| (x * 100.0).round() / 100.0), is.map(|x| (x * 100.0).round() / 100.0), fmt(slack)));
                         }
                     }
                     if m.design_name.is_empty() {
@@ -455,10 +523,10 @@ fn check_parts(bundle: &Bundle, part_docs: &[&Document], parts: &BTreeMap<String
                         row.set("design_name", m.design_name.as_str());
                     }
                 } else {
-                    problems.push("the built design has no measurement".into());
+                    other.push("the built design has no measurement".into());
                 }
             }
-            (Some(f), None) => problems.push(format!("design {f} was not measured")),
+            (Some(f), None) => other.push(format!("design {f} was not measured")),
         }
         if let Some(f) = file_of_doc.get(&d.id) {
             let others: Vec<&&Document> = part_docs.iter().filter(|o| o.id != d.id && file_of_doc.get(&o.id) == Some(f)).collect();
@@ -466,19 +534,79 @@ fn check_parts(bundle: &Bundle, part_docs: &[&Document], parts: &BTreeMap<String
                 row.set("shares_design_with", others.iter().map(|o| o.name.clone()).collect::<Vec<_>>());
             }
         }
-        if problems.is_empty() {
-            ok += 1;
-            row.set("status", "ok");
+        // Why it differs.
+        let hidden = d.mass.hidden_bodies.unwrap_or(0);
+        let bodies = d.mass.bodies.unwrap_or(1);
+        let import_open = p.reference.geo.as_ref().map_or(0, |g| g.open_bodies);
+        let cause = if !other.is_empty() {
+            Some(Cause::Converter)
+        } else if !vs_step.is_empty() {
+            let explained = d.sheet_metal.as_ref().is_some_and(|sm| vol_rel_step <= SHEET_VOLUME_REL && box_off <= sm.thickness && com_off <= sm.thickness);
+            Some(if explained { Cause::SheetMetal } else { Cause::Converter })
+        } else if !vs_inventor.is_empty() {
+            let vol_off = inv_volume_rel.is_some_and(|r| r > tol.bundle_volume_rel);
+            // The bundle's volume is Inventor's whole volume (no visible-only figure) while
+            // some bodies are hidden: the STEP has less, by what those hold.
+            let hidden_in_volume = hidden > 0 && d.mass.all_volume_mm3 == d.mass.volume_mm3;
+            Some(if import_open > 0 {
+                Cause::Import
+            } else if vol_off {
+                if hidden_in_volume && built_volume.zip(d.mass.all_volume_mm3).is_some_and(|(b, all)| b <= all * (1.0 + tol.bundle_volume_rel)) {
+                    Cause::Bodies
+                } else {
+                    Cause::Export
+                }
+            } else if box_only_larger_inventor {
+                // Only the range box, larger than the part: hidden bodies are inside it, or
+                // it is loose on curves.
+                if hidden > 0 || bodies > 1 {
+                    Cause::Bodies
+                } else {
+                    Cause::RangeBox
+                }
+            } else {
+                Cause::Export
+            })
         } else {
-            failed += 1;
-            row.set("status", "FAIL");
-            for p in &problems {
-                details.push(format!("{}: {p}", d.name));
+            None
+        };
+        let problems: Vec<String> = other.into_iter().chain(vs_step).chain(vs_inventor).collect();
+        match cause {
+            None => {
+                ok += 1;
+                row.set("status", "ok");
             }
-            row.set("problems", problems);
+            Some(c) => {
+                let why = match c {
+                    Cause::Converter => "the built design is not what SolidCraft makes of its STEP".to_string(),
+                    Cause::SheetMetal => format!("rebuilt as sheet metal at {} mm: within {:.0}% of the volume and the thickness of the import", d.sheet_metal.as_ref().map_or(0.0, |s| s.thickness), SHEET_VOLUME_REL * 100.0),
+                    Cause::Import => format!("SolidCraft's own import of the STEP leaves {import_open} of {} body(ies) open (faces it could not build), so it has no volume; the design is that import", p.reference.geo.as_ref().map_or(0, |g| g.bodies)),
+                    Cause::Bodies => format!("Inventor counts {bodies} body(ies), {hidden} hidden (the STEP holds the visible ones)"),
+                    Cause::RangeBox => "the volume matches Inventor's; its range box is larger than the part (not tight on curved faces)".to_string(),
+                    Cause::Export => "the design matches its STEP, but the STEP does not match Inventor's figures".to_string(),
+                };
+                let e = by_cause.entry(c.name()).or_insert((0, c.fails()));
+                e.0 += 1;
+                row.set("cause", c.name());
+                row.set("cause_detail", why.as_str());
+                row.set("problems", problems.clone());
+                let lines = problems.iter().map(|p| format!("{}: {p}", d.name));
+                if c.fails() {
+                    failed += 1;
+                    row.set("status", "FAIL");
+                    details.push(format!("{} [{}: {why}]", d.name, c.name()));
+                    details.extend(lines);
+                } else {
+                    ok += 1;
+                    row.set("status", "explained");
+                    explained_details.push(format!("{} [{}, not a failure: {why}]", d.name, c.name()));
+                    explained_details.extend(lines);
+                }
+            }
         }
         rows.push(row);
     }
+    details.extend(explained_details);
     // A systematic factor in every volume points at units, not at single parts.
     let mut factor_note = None;
     if ratios.len() >= 3 {
@@ -497,16 +625,24 @@ fn check_parts(bundle: &Bundle, part_docs: &[&Document], parts: &BTreeMap<String
     }
     let total = part_docs.len();
     let status = if failed > 0 { Status::Fail } else { Status::Pass };
+    let causes = if by_cause.is_empty() {
+        String::new()
+    } else {
+        format!(" (by cause: {})", by_cause.iter().map(|(n, (k, fails))| format!("{k} {n}{}", if *fails { "" } else { ", explained" })).collect::<Vec<_>>().join("; "))
+    };
+    let explained: usize = by_cause.values().filter(|(_, f)| !f).map(|(k, _)| k).sum();
     let summary = format!(
-        "{ok} of {} part designs match (volume within {:.2}% and box within {} mm of SolidCraft's own import of the STEP{}); {failed} do not, {skipped} not expected (the STEP holds no solid){}",
+        "{ok} of {} part designs match (volume within {:.2}% and box within {} mm of SolidCraft's own import of the STEP{}){}; {failed} do not, {skipped} not expected (the STEP holds no solid){}{causes}",
         total - skipped,
         tol.volume_rel * 100.0,
         tol.bbox_mm,
         if with_bundle > 0 { format!("; {with_bundle} also against Inventor's volume within {:.1}%", tol.bundle_volume_rel * 100.0) } else { "; no mass in the bundle (no Inventor volume or box for any part), so nothing was compared against Inventor's own numbers".to_string() },
+        if explained > 0 { format!(", {explained} of them with a difference that is explained and not a failure") } else { String::new() },
         factor_note.as_ref().map(|_| ", and a systematic factor").unwrap_or_default()
     );
     let _ = bundle;
-    Check { id: 1, title: "Part designs: saved, volume, bounding box".into(), status, summary, details, data: obj! {"parts" => Json::Arr(rows), "systematic_factor" => factor_note} }
+    let causes_json = Json::Arr(by_cause.iter().map(|(n, (k, f))| obj! {"cause" => *n, "parts" => *k, "fails" => *f}).collect());
+    Check { id: 1, title: "Part designs: saved, volume, bounding box".into(), status, summary, details, data: obj! {"parts" => Json::Arr(rows), "systematic_factor" => factor_note, "causes" => causes_json} }
 }
 
 #[allow(clippy::too_many_arguments)]

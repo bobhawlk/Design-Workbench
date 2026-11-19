@@ -131,7 +131,7 @@ impl ProgressSink {
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
         let text = self.progress_json().to_pretty();
-        if let Err(e) = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)) {
+        if let Err(e) = write_replacing(&tmp, &path, &text) {
             self.io_failed(format!("{}: {e}", path.display()));
         }
     }
@@ -239,5 +239,46 @@ impl Observer for ProgressSink {
         if self.print {
             eprintln!("  {message}");
         }
+    }
+}
+
+/// Write `text` beside `path` and rename it over `path`, trying again for a little under a
+/// second when it fails: a folder a sync client (Dropbox, OneDrive) or a virus scanner watches
+/// holds the file for a moment after each change, and Windows then refuses the write or the
+/// rename ("Access is denied"). Only a failure that outlasts the retries is returned.
+pub fn write_replacing(tmp: &std::path::Path, path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let mut wait = std::time::Duration::from_millis(25);
+    let mut last = None;
+    for attempt in 0..6 {
+        match std::fs::write(tmp, text).and_then(|_| std::fs::rename(tmp, path)) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+            Err(e) => last = Some(e),
+        }
+        if attempt < 5 {
+            std::thread::sleep(wait);
+            wait *= 2;
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("could not write")))
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::write_replacing;
+
+    #[test]
+    fn a_write_that_keeps_failing_is_reported_after_its_retries_and_one_that_works_is_quiet() {
+        let d = std::env::temp_dir().join(format!("inv2sc-progress-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("busy")).unwrap();
+        std::fs::write(d.join("busy").join("x"), "held").unwrap();
+        // Renaming a file over a folder that is not empty fails every time, like a held file.
+        let t0 = std::time::Instant::now();
+        assert!(write_replacing(&d.join("p.tmp"), &d.join("busy"), "{}").is_err());
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(700), "{:?}", t0.elapsed());
+        write_replacing(&d.join("q.tmp"), &d.join("progress.json"), "{\"a\": 1}").unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("progress.json")).unwrap(), "{\"a\": 1}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

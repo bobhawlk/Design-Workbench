@@ -205,7 +205,7 @@ fn sheet_steps(sp: &SheetPlan, name: &str) -> Vec<Step> {
     }
     vec![
         Step::op("sheet_rule", rule, format!("sheet metal rule {}", sp.rule)).soft().group("sheet metal"),
-        Step::op("sheet_convert", convert, format!("make {name} sheet metal")).soft().needs("body").bind("sheet", &["/name", "/id"]).group("sheet metal"),
+        Step::op("sheet_convert", convert, format!("make {name} sheet metal")).soft().needs("body").bind("sheet", &["/name", "/id"]).group("sheet metal").keep_volume(),
     ]
 }
 

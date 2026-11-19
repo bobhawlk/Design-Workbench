@@ -40,11 +40,15 @@ pub struct Step {
     /// and the step undone and reported when one of them moved. Placement is the truth; a
     /// constraint or joint is kept only when the parts are still where Inventor had them.
     pub guard: Vec<Json>,
+    /// The design's solid volume must not change by more than the profile's
+    /// `mechanism.volume_guard.tol_rel`: measured before and after, and the step undone and
+    /// reported as failed when it did (a sheet metal conversion that drops a flange).
+    pub keep_volume: bool,
 }
 
 impl Step {
     pub fn tool(tool: &str, args: Json, label: impl Into<String>) -> Step {
-        Step { tool: tool.into(), op: None, args, bind: Vec::new(), on_error: OnError::Stop, label: label.into(), needs: Vec::new(), alternatives: Vec::new(), group: String::new(), guard: Vec::new() }
+        Step { tool: tool.into(), op: None, args, bind: Vec::new(), on_error: OnError::Stop, label: label.into(), needs: Vec::new(), alternatives: Vec::new(), group: String::new(), guard: Vec::new(), keep_volume: false }
     }
     pub fn op(op: &str, params: Json, label: impl Into<String>) -> Step {
         Step {
@@ -58,11 +62,17 @@ impl Step {
             alternatives: Vec::new(),
             group: String::new(),
             guard: Vec::new(),
+            keep_volume: false,
         }
     }
     /// Undo the step when it moves any of these placements (see [`Step::guard`]).
     pub fn guard(mut self, placements: Vec<Json>) -> Step {
         self.guard = placements;
+        self
+    }
+    /// Undo the step when it changes the design's volume (see [`Step::keep_volume`]).
+    pub fn keep_volume(mut self) -> Step {
+        self.keep_volume = true;
         self
     }
     pub fn group(mut self, group: &str) -> Step {
@@ -122,6 +132,9 @@ impl Step {
         if !self.guard.is_empty() {
             j.set("guard", Json::Arr(self.guard.clone()));
         }
+        if self.keep_volume {
+            j.set("keep_volume", true);
+        }
         j
     }
 
@@ -145,6 +158,7 @@ impl Step {
             alternatives: j.arr_of("alternatives").iter().filter_map(|a| Some((a.str_of("op")?.to_string(), a.get("args").cloned().unwrap_or_else(Json::obj)))).collect(),
             group: j.str_of("group").unwrap_or_default().to_string(),
             guard: j.arr_of("guard").to_vec(),
+            keep_volume: j.bool_of("keep_volume").unwrap_or(false),
             tool,
         })
     }

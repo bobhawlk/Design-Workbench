@@ -64,7 +64,13 @@ pub enum DocKind {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Mass {
+    /// The visible solid bodies' volume (what the STEP holds), else Inventor's whole volume.
     pub volume_mm3: Option<f64>,
+    /// Inventor's own volume of the part, hidden bodies included (`volume_mm3` in the file).
+    pub all_volume_mm3: Option<f64>,
+    /// Solid bodies in the part, and how many of them are hidden (they are not in the STEP).
+    pub bodies: Option<u32>,
+    pub hidden_bodies: Option<u32>,
     pub area_mm2: Option<f64>,
     pub bbox_min: Option<V3>,
     pub bbox_max: Option<V3>,
@@ -518,6 +524,9 @@ fn doc_from(j: &Json) -> Result<Document, BundleError> {
         // The STEP holds the visible solid bodies only, so when the exporter says what those add up
         // to, that is the volume to compare against; Inventor's own figure counts hidden bodies too.
         volume_mm3: mass_j.f64_of("visible_volume_mm3").or(mass_j.f64_of("volume_mm3")),
+        all_volume_mm3: mass_j.f64_of("volume_mm3"),
+        bodies: mass_j.f64_of("bodies").map(|x| x as u32),
+        hidden_bodies: mass_j.f64_of("hidden_bodies").map(|x| x as u32),
         area_mm2: mass_j.f64_of("area_mm2"),
         bbox_min: v(&mass_j, "bbox_min"),
         bbox_max: v(&mass_j, "bbox_max"),
@@ -749,7 +758,8 @@ fn doc_to(d: &Document) -> Json {
         "material" => d.material.clone(),
         "step" => d.step.clone(),
         "mass" => obj!{
-            "volume_mm3" => d.mass.volume_mm3, "area_mm2" => d.mass.area_mm2,
+            "volume_mm3" => d.mass.all_volume_mm3.or(d.mass.volume_mm3), "visible_volume_mm3" => d.mass.volume_mm3, "area_mm2" => d.mass.area_mm2,
+            "bodies" => d.mass.bodies.map(f64::from), "hidden_bodies" => d.mass.hidden_bodies.map(f64::from),
             "bbox_min" => ovj(d.mass.bbox_min), "bbox_max" => ovj(d.mass.bbox_max),
         },
         "sheet_metal" => d.sheet_metal.as_ref().map_or(Json::Null, sheet_to),

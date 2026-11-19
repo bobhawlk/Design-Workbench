@@ -54,6 +54,12 @@ OPTIONS:
   --inventor-constraints  also create SolidCraft constraints from Inventor constraints whose
                           geometry lands on the parts (off by default: parts are joined by
                           their geometry, and Inventor's constraints are evidence only)
+  --up y|z                which axis is up in the source (default: y for an Inventor bundle,
+                          z for a plain STEP). With y the assembly is stood upright: one quarter
+                          turn about X on the root, so Inventor's up is SolidCraft's +Z and its
+                          front view is SolidCraft's front view. The turn is written to
+                          orientation.json, which verify reads
+  --keep-axes             keep the source's axes as they are (the same as --up z)
   --no-patterns           don't make pattern spacing a parameter
   --max-thickness MM      thickest plate treated as sheet metal (default 6)
   --path-map FROM=TO      write paths for another machine: build steps made here name
@@ -75,6 +81,8 @@ OPTIONS:
   --tol-deg DEG           verify: frame angle tolerance (default 0.05)
   --clash-budget SECS     verify: time allowed for the interference check (default 600)
   --no-clash              verify: skip the interference check
+  --root-turn y-up|none   verify: the turn convert put on the root (default: what the built
+                          folder's orientation.json says, else none)
   --quiet                 no progress lines (progress.json and build-log.jsonl are still written)
   --verbose               print every step and its outcome
 ";
@@ -107,6 +115,8 @@ struct Args {
     clash_budget: Option<f64>,
     no_clash: bool,
     redo: bool,
+    up: Option<String>,
+    root_turn: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -140,6 +150,8 @@ fn parse_args() -> Result<Args, String> {
         clash_budget: None,
         no_clash: false,
         redo: false,
+        up: None,
+        root_turn: None,
     };
     while let Some(x) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -174,6 +186,21 @@ fn parse_args() -> Result<Args, String> {
             "--clash-budget" => a.clash_budget = Some(value("--clash-budget")?.parse().map_err(|_| "--clash-budget takes a number of seconds")?),
             "--no-clash" => a.no_clash = true,
             "--redo" => a.redo = true,
+            "--keep-axes" => a.up = Some("z".into()),
+            "--up" => {
+                let v = value("--up")?.to_ascii_lowercase();
+                if v != "y" && v != "z" {
+                    return Err(format!("--up takes y or z, not `{v}`"));
+                }
+                a.up = Some(v);
+            }
+            "--root-turn" => {
+                let v = value("--root-turn")?.to_ascii_lowercase();
+                if v != "y-up" && v != "none" {
+                    return Err(format!("--root-turn takes y-up or none, not `{v}`"));
+                }
+                a.root_turn = Some(v);
+            }
             "--timeout" => {
                 let secs: f64 = value("--timeout")?.parse().map_err(|_| "--timeout takes a number of seconds")?;
                 if !(secs.is_finite() && secs > 0.0) {
@@ -239,12 +266,44 @@ fn load_profile(a: &Args) -> Result<Profile, String> {
 }
 
 fn load_model(input: &Path) -> Result<Model, String> {
-    let is_bundle = input.is_dir() || input.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
-    if is_bundle {
+    if is_bundle(input) {
         let b = lcw_bundle::Bundle::read(input).map_err(|e| e.to_string())?;
         Model::from_bundle(&b)
     } else {
         Model::from_step(input)
+    }
+}
+
+fn is_bundle(input: &Path) -> bool {
+    input.is_dir() || input.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"))
+}
+
+/// The file in a built folder that says which turn convert put on the root (verify reads it).
+const ORIENTATION_FILE: &str = "orientation.json";
+
+/// The model, stood upright when its source has Y up (an Inventor bundle unless `--up z` or
+/// `--keep-axes`; a plain STEP only with `--up y`). Returns the turn put on the root, if any.
+fn load_upright(a: &Args, input: &Path) -> Result<(Model, Option<lcw_geom::M4>), String> {
+    let mut model = load_model(input)?;
+    let up = a.up.clone().unwrap_or_else(|| if is_bundle(input) { "y".into() } else { "z".into() });
+    if up == "y" {
+        let r = lcw_analyze::model::Y_UP_TO_Z_UP;
+        model.turn_root(&r);
+        return Ok((model, Some(r)));
+    }
+    Ok((model, None))
+}
+
+fn orientation_json(turn: Option<&lcw_geom::M4>, source_app: &str) -> Json {
+    let m = turn.copied().unwrap_or(lcw_geom::M4::IDENTITY);
+    let rows: Vec<f64> = m.0.iter().flatten().copied().collect();
+    lcw_json::obj! {
+        "schema" => "inv2sc-orientation/1",
+        "about" => "The turn convert put on the assembly's root, as a row-major 4x4 matrix applied to the source's coordinates (column vectors): SolidCraft's world = root_turn x the source's world.",
+        "source_app" => source_app,
+        "source_up" => if turn.is_some() { "y" } else { "z" },
+        "root_turn" => rows,
+        "name" => if turn.is_some() { "y-up" } else { "none" },
     }
 }
 
@@ -357,13 +416,18 @@ fn write_part_steps(a: &Analysis, out: &Path, skipped: &mut Vec<String>) -> Resu
 
 fn convert(a: &Args, input: &Path) -> Result<bool, String> {
     let t0 = std::time::Instant::now();
-    let model = load_model(input)?;
+    let (model, turn) = load_upright(a, input)?;
+    let source_app = model.source_app.clone();
     let mut analysis = analyze(model, &analysis_options(a));
+    if turn.is_some() {
+        analysis.notes.push("stood upright: the source has Y up, so the root is turned a quarter turn about X (Y up becomes SolidCraft's Z up, and the source's front view is SolidCraft's front view); `--keep-axes` keeps the source's axes".into());
+    }
     let out = a.out.clone().unwrap_or_else(|| {
         let base = if input.is_dir() { input.to_path_buf() } else { input.parent().map(Path::to_path_buf).unwrap_or_default() };
         base.join("SolidCraft")
     });
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    std::fs::write(out.join(ORIENTATION_FILE), orientation_json(turn.as_ref(), &source_app).to_pretty()).map_err(|e| e.to_string())?;
     let mut skipped = Vec::new();
     let steps_by_def = write_part_steps(&analysis, &out, &mut skipped)?;
     for name in &skipped {
@@ -488,7 +552,7 @@ fn limits(a: &Args, built: &Path) -> Result<bool, String> {
 }
 
 fn analyze_only(a: &Args, input: &Path) -> Result<bool, String> {
-    let analysis = analyze(load_model(input)?, &analysis_options(a));
+    let analysis = analyze(load_upright(a, input)?.0, &analysis_options(a));
     println!("{}", report::markdown(&analysis, &[], &[], &[]));
     Ok(true)
 }
@@ -513,6 +577,37 @@ fn run_steps(a: &Args, steps: &Path) -> Result<bool, String> {
     std::fs::write(out.join("run-report.json"), lcw_json::obj! {"schema" => "lcw-run-report/1", "steps" => abs(steps), "events" => events, "builds" => report::builds_json(&runs)}.to_pretty()).map_err(|e| e.to_string())?;
     eprintln!("report: {}", out.join("run-report.md").display());
     Ok(runs.iter().all(|r| r.saved))
+}
+
+/// The turn verify puts the bundle's placements through: `--root-turn`, else the built folder's
+/// orientation.json (a rigid rotation, checked here), else none.
+fn root_turn_for_verify(a: &Args, built: &Path) -> Result<(lcw_geom::M4, String), String> {
+    use lcw_verify::expect::Y_UP;
+    match a.root_turn.as_deref() {
+        Some("y-up") => return Ok((Y_UP, "Y up to Z up, a quarter turn about X (--root-turn y-up)".into())),
+        Some(_) => return Ok((lcw_geom::M4::IDENTITY, "none (--root-turn none)".into())),
+        None => {}
+    }
+    let f = built.join(ORIENTATION_FILE);
+    let Ok(text) = std::fs::read_to_string(&f) else { return Ok((lcw_geom::M4::IDENTITY, format!("none (no {ORIENTATION_FILE} in the built folder)"))) };
+    let j = Json::parse(&text).map_err(|e| format!("{}: {e}", f.display()))?;
+    let v: Vec<f64> = j.arr_of("root_turn").iter().filter_map(Json::as_f64).collect();
+    let m = lcw_geom::M4::from_slice(&v).ok_or_else(|| format!("{}: `root_turn` is not a 4x4 matrix", f.display()))?;
+    // A rotation about the origin, nothing else.
+    let r = m.0;
+    let ortho = (0..3).all(|i| (0..3).all(|k| ((0..3).map(|n| r[i][n] * r[k][n]).sum::<f64>() - if i == k { 1.0 } else { 0.0 }).abs() < 1e-9));
+    let det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1]) - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0]) + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]);
+    if !ortho || (det - 1.0).abs() > 1e-9 || (0..3).any(|i| r[i][3].abs() > 1e-9 || r[3][i].abs() > 1e-9) {
+        return Err(format!("{}: `root_turn` is not a rotation about the origin", f.display()));
+    }
+    let what = if (0..4).all(|i| (0..4).all(|k| (m.0[i][k] - Y_UP.0[i][k]).abs() < 1e-12)) {
+        "Y up to Z up, a quarter turn about X"
+    } else if m == lcw_geom::M4::IDENTITY {
+        "none"
+    } else {
+        "a rotation"
+    };
+    Ok((m, format!("{what} (from {ORIENTATION_FILE}: rows {:?})", m.0.iter().take(3).map(|r| [r[0], r[1], r[2]]).collect::<Vec<_>>())))
 }
 
 /// Check a finished build against the bundle it came from.
@@ -572,8 +667,10 @@ fn verify(a: &Args, input: &Path) -> Result<bool, String> {
             eprintln!("verify: {m}");
         }
     };
+    let (root_turn, root_turn_note) = root_turn_for_verify(a, &built)?;
+    eprintln!("verify: root turn {root_turn_note}");
     let mut session = lcw_verify::session::Session::new(&mut client, &profile, a.timeout.unwrap_or(DEFAULT_TIMEOUT));
-    let report = lcw_verify::run(&mut session, &lcw_verify::Inputs { bundle: &bundle, built: &built, assembly: &assembly, tol: tol.clone(), log: &log })?;
+    let report = lcw_verify::run(&mut session, &lcw_verify::Inputs { bundle: &bundle, built: &built, assembly: &assembly, tol: tol.clone(), root_turn, root_turn_note, log: &log })?;
     std::fs::write(out.join("verification-report.md"), lcw_verify::report::markdown(&report, &tol)).map_err(|e| e.to_string())?;
     std::fs::write(out.join("verification.json"), lcw_verify::report::json(&report, &tol).to_pretty()).map_err(|e| e.to_string())?;
     println!("{}", report.summary_line());
@@ -655,6 +752,8 @@ fn clone_args(a: &Args) -> Args {
         clash_budget: a.clash_budget,
         no_clash: a.no_clash,
         redo: a.redo,
+        up: a.up.clone(),
+        root_turn: a.root_turn.clone(),
     }
 }
 

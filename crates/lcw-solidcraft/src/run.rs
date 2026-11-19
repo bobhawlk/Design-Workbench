@@ -327,6 +327,15 @@ impl<'a> Runner<'a> {
                 Err(o) => return o,
             }
         }
+        // The design's volume before a step that must keep it.
+        let volume_before = if step.keep_volume {
+            match self.volume_now() {
+                Ok(v) => v,
+                Err(o) => return o,
+            }
+        } else {
+            None
+        };
         let timeout = self.profile.timeout_for(step.op.as_deref(), &step.tool, self.timeout);
         let mut first = match (known_error, &step.op) {
             (Some(e), _) => Err(CallError::Failed(e)),
@@ -434,8 +443,51 @@ impl<'a> Runner<'a> {
                 return Outcome::of(if undone { Status::Skipped(format!("{why}, so it was undone")) } else { Status::Failed(format!("{why}, and undoing it did not put it back")) });
             }
         }
+        // A step that must keep the volume (a sheet metal conversion that dropped a flange, or
+        // was cut open where it should not be) is undone: the part stays the solid it was.
+        if let Some(v0) = volume_before {
+            let v1 = match self.volume_now() {
+                Ok(v) => v,
+                Err(o) => return o,
+            };
+            let tol = self.profile.mechanism.get("volume_guard").and_then(|x| x.f64_of("tol_rel")).unwrap_or(0.01);
+            if let Some(v1) = v1 {
+                let rel = (v1 - v0).abs() / v0.abs().max(1e-9);
+                if rel > tol {
+                    let t = self.profile.timeout_for(Some("undo"), "execute", self.timeout);
+                    let undone = match self.execute_op("undo", &Json::obj(), t) {
+                        Ok(_) => match self.volume_now() {
+                            Ok(Some(v)) => (v - v0).abs() / v0.abs().max(1e-9) <= tol,
+                            Ok(None) => false,
+                            Err(o) => return o,
+                        },
+                        Err(e) if e.ends_session() => return Outcome::lost(&e, &format!("undoing {}", step.label)),
+                        Err(_) => false,
+                    };
+                    let how = match &status {
+                        Status::Fallback(h) => format!(" ({h})"),
+                        _ => String::new(),
+                    };
+                    let why = format!("it changed the part's volume by {:.1}% ({} to {} mm3){how}", rel * 100.0, fmt3(v0), fmt3(v1));
+                    return Outcome::of(Status::Failed(if undone { format!("{why}, so it was undone and the part stays a solid") } else { format!("{why}, and undoing it did not restore the volume") }));
+                }
+            }
+        }
         self.bind(step, &result);
         Outcome { status, note, data: Json::Null, lost: None }
+    }
+
+    /// The design's closed-solid volume (mm3), as the profile's `mechanism.volume_guard` reads
+    /// it; None when it cannot be read (then nothing is guarded).
+    fn volume_now(&mut self) -> Result<Option<f64>, Outcome> {
+        let vg = self.profile.mechanism.get("volume_guard").cloned().unwrap_or_default();
+        let (Some(op), Some(ptr)) = (vg.str_of("op").map(str::to_string), vg.str_of("volume").map(str::to_string)) else { return Ok(None) };
+        let t = self.profile.timeout_for(Some(&op), "execute", self.timeout);
+        match self.execute_op(&op, &Json::obj(), t) {
+            Ok(r) => Ok(r.pointer(&ptr).and_then(Json::as_f64).filter(|v| v.is_finite() && *v > 0.0)),
+            Err(e) if e.ends_session() => Err(Outcome::lost(&e, "measuring the design's volume")),
+            Err(_) => Ok(None),
+        }
     }
 
     /// A placement's position, as the points the profile's `mechanism.guard` names (centre of
@@ -955,7 +1007,7 @@ impl<'a> Runner<'a> {
                 break;
             }
             let Some(op) = step.op.as_deref() else { break };
-            if !step.guard.is_empty() {
+            if !step.guard.is_empty() || step.keep_volume {
                 break;
             }
             if step.tool != "execute" || self.profile.resolve(op) != Some(op) {
@@ -1311,5 +1363,34 @@ mod tests {
         // The placement got the bound occurrence id.
         let place = &rec.calls.iter().find(|(_, a)| a.str_of("command") == Some("occurrence.move")).unwrap().1;
         assert_eq!(place.pointer("params/occurrence").and_then(Json::as_f64), Some(1102.0));
+    }
+
+    #[test]
+    fn a_conversion_that_loses_volume_is_undone() {
+        use crate::mcp::Action;
+        let profile = Profile::builtin();
+        let vol = |v: f64| Action::Answer(obj! {"total" => obj!{"volume_mm3" => v}});
+        // Before, after (half of it gone), after the undo.
+        let mut rec = Recorder::new().on("inspect.measure", vol(1000.0), 1).on("inspect.measure", vol(510.0), 1).on("inspect.measure", vol(1000.0), 1);
+        let design = DesignSteps {
+            name: "t".into(),
+            file: "t.sc".into(),
+            steps: vec![Step::op("sheet_convert", obj! {"body" => "B", "face" => vec![0.0, 0.0, 0.0]}, "make t sheet metal").soft().keep_volume(), Step::tool("save", obj! {"path" => "t.sc"}, "save")],
+            notes: Vec::new(),
+            continues: false,
+        };
+        let r = Runner::new(&mut rec, &profile).run(&design);
+        assert!(r.saved);
+        match &r.steps[0].status {
+            Status::Failed(why) => assert!(why.contains("49.0%") && why.contains("undone"), "{why}"),
+            s => panic!("{s:?}"),
+        }
+        assert!(rec.commands().iter().any(|c| c == "edit.undo"));
+
+        // Within the tolerance it stands.
+        let mut rec = Recorder::new().on("inspect.measure", vol(1000.0), 1).on("inspect.measure", vol(1004.0), 1);
+        let r = Runner::new(&mut rec, &profile).run(&design);
+        assert_eq!(r.steps[0].status, Status::Done);
+        assert!(!rec.commands().iter().any(|c| c == "edit.undo"));
     }
 }
