@@ -71,11 +71,13 @@ pub struct StepResult {
     pub batched: bool,
     /// Something to know about a step that went through (one end of a limit is a guess…).
     pub note: String,
+    /// What a check step found, for the report (`verify_joints`); null otherwise.
+    pub data: Json,
 }
 
 impl StepResult {
     fn new(step: &Step, status: Status) -> StepResult {
-        StepResult { label: step.label.clone(), group: step.group_name().to_string(), op: step.op.clone().unwrap_or_else(|| step.tool.clone()), status, command: String::new(), ms: 0.0, calls: 0, batched: false, note: String::new() }
+        StepResult { label: step.label.clone(), group: step.group_name().to_string(), op: step.op.clone().unwrap_or_else(|| step.tool.clone()), status, command: String::new(), ms: 0.0, calls: 0, batched: false, note: String::new(), data: Json::Null }
     }
 }
 
@@ -138,19 +140,21 @@ type BatchOutcome = (Vec<(usize, StepResult, Option<String>)>, usize, Option<usi
 struct Outcome {
     status: Status,
     note: String,
+    data: Json,
     /// The session was given up during it.
     lost: Option<String>,
 }
 
 impl Outcome {
     fn of(status: Status) -> Outcome {
-        Outcome { status, note: String::new(), lost: None }
+        Outcome { status, note: String::new(), data: Json::Null, lost: None }
     }
     fn lost(e: &CallError, what: &str) -> Outcome {
         let msg = e.message().to_string();
         Outcome {
             status: Status::Failed(format!("{msg} (while {what}); the SolidCraft session was given up, since the call may still be running there")),
             note: String::new(),
+            data: Json::Null,
             lost: Some(msg),
         }
     }
@@ -303,6 +307,9 @@ impl<'a> Runner<'a> {
         if step.tool == "auto_limits" {
             return self.auto_limits(&args);
         }
+        if step.tool == "verify_joints" {
+            return self.verify_joints(&args);
+        }
         let timeout = self.profile.timeout_for(step.op.as_deref(), &step.tool, self.timeout);
         let mut first = match (known_error, &step.op) {
             (Some(e), _) => Err(CallError::Failed(e)),
@@ -388,7 +395,7 @@ impl<'a> Runner<'a> {
             }
         };
         self.bind(step, &result);
-        Outcome { status, note, lost: None }
+        Outcome { status, note, data: Json::Null, lost: None }
     }
 
     fn bind(&mut self, step: &Step, result: &Json) {
@@ -457,6 +464,153 @@ impl<'a> Runner<'a> {
             Err(e) if e.ends_session() => Outcome::lost(&e, &format!("setting the limits of {jname}")),
             Err(e) => Outcome::of(Status::Failed(e.message().to_string())),
         }
+    }
+
+    /// Check the mechanism SolidCraft solved: degrees of freedom, conflicts and floating chains
+    /// from `joint_list`, then each joint of `joints` (`{name, type, basis}`) driven a little
+    /// within its limits and back. Every name it reads is in the profile's `verify` section.
+    fn verify_joints(&mut self, args: &Json) -> Outcome {
+        let v = self.profile.verify.clone();
+        let (Some(lp), Some(dp)) = (v.get("list").cloned(), v.get("drive").cloned()) else {
+            return Outcome::of(Status::Skipped("the profile has no `verify` section".into()));
+        };
+        let key = |j: &Json, k: &str| j.str_of(k).unwrap_or(k).to_string();
+        let at = |r: &Json, sec: &Json, k: &str| -> Json { r.pointer(&key(sec, k)).cloned().unwrap_or(Json::Null) };
+        let t = self.profile.timeout_for(Some("joint_list"), "execute", self.timeout);
+        let list = match self.execute_op("joint_list", &obj! {"quiet" => false}, t) {
+            Ok(r) => r,
+            Err(e) if e.ends_session() => return Outcome::lost(&e, "listing the joints"),
+            Err(e) => return Outcome::of(Status::Failed(e.message().to_string())),
+        };
+        // Degrees of freedom left per occurrence.
+        let mut dof: BTreeMap<i64, usize> = BTreeMap::new();
+        for d in at(&list, &lp, "dof").as_array().unwrap_or(&[]) {
+            if let Some(n) = d.get(&key(&lp, "dof_value")).and_then(Json::as_f64) {
+                *dof.entry(n as i64).or_default() += 1;
+            }
+        }
+        let problems = |which: &str| -> Vec<Json> {
+            at(&list, &lp, which).as_array().unwrap_or(&[]).iter().map(|p| obj! {"joint" => p.str_of(&key(&lp, "problem_name")).unwrap_or("?"), "why" => p.str_of(&key(&lp, "problem_why")).unwrap_or("")}).collect()
+        };
+        let conflicts = problems("conflicts");
+        let errors = problems("errors");
+        let floating: Vec<Json> = at(&list, &lp, "floating")
+            .as_array()
+            .unwrap_or(&[])
+            .iter()
+            .map(|c| obj! {"occurrences" => c.get(&key(&lp, "chain_occurrences")).cloned().unwrap_or(Json::Null), "joints" => c.get(&key(&lp, "chain_joints")).cloned().unwrap_or(Json::Null)})
+            .collect();
+        let listed = at(&list, &lp, "joints");
+        let listed = listed.as_array().unwrap_or(&[]);
+        let types: Vec<String> = v.arr_of("drive_types").iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+        let step_of = |unit: &str| v.get("test_move").and_then(|m| m.f64_of(if unit == "mm" { "mm" } else { "deg" })).unwrap_or(if unit == "mm" { 1.0 } else { 5.0 });
+        let mut checks = Vec::new();
+        let (mut driven, mut stuck) = (0usize, 0usize);
+        for j in args.arr_of("joints") {
+            let name = j.str_of("name").unwrap_or("").to_string();
+            let kind = j.str_of("type").unwrap_or("").to_string();
+            let mut c = obj! {"joint" => name.as_str(), "type" => kind.as_str(), "basis" => j.str_of("basis").unwrap_or("")};
+            let found = listed.iter().find(|x| x.str_of(&key(&lp, "joint_name")) == Some(name.as_str()));
+            let Some(found) = found else {
+                c.set("result", "not in the design (its step failed or was left out)");
+                checks.push(c);
+                continue;
+            };
+            let first = found.get(&key(&lp, "joint_values")).and_then(Json::as_array).and_then(|a| a.first()).cloned().unwrap_or_default();
+            let v0 = first.f64_of(&key(&lp, "value")).unwrap_or(0.0);
+            let unit = first.str_of(&key(&lp, "value_unit")).unwrap_or("deg").to_string();
+            let lim = first.get(&key(&lp, "value_limits")).and_then(Json::as_array).filter(|l| l.len() == 2).map(|l| [l[0].as_f64().unwrap_or(f64::NEG_INFINITY), l[1].as_f64().unwrap_or(f64::INFINITY)]);
+            if let Some(l) = lim.filter(|l| l[0].is_finite() && l[1].is_finite()) {
+                c.set("limits", Json::from(l));
+            }
+            c.set("unit", unit.as_str());
+            if !types.contains(&kind) {
+                c.set("result", "not driven (no motion to check)");
+                checks.push(c);
+                continue;
+            }
+            let step = step_of(&unit);
+            let (up, down) = match lim {
+                Some([lo, hi]) => (hi - v0, v0 - lo),
+                None => (f64::INFINITY, f64::INFINITY),
+            };
+            let mut tries: Vec<f64> = Vec::new();
+            for room in [(up, 1.0), (down, -1.0)] {
+                if room.0 > 1e-6 {
+                    tries.push(v0 + room.1 * step.min(room.0 / 2.0));
+                }
+            }
+            if tries.is_empty() {
+                c.set("result", "no travel within its limits");
+                stuck += 1;
+                checks.push(c);
+                continue;
+            }
+            let dt = self.profile.timeout_for(Some("drive"), "execute", self.timeout);
+            let mut outcome = None;
+            let mut why_not = Vec::new();
+            for target in tries {
+                match self.execute_op("drive", &obj! {"joint" => name.as_str(), "value" => target, "quiet" => true}, dt) {
+                    Ok(r) => {
+                        let moved = at(&r, &dp, "moved").as_bool().unwrap_or(false);
+                        let reached = at(&r, &dp, "values").as_array().and_then(|a| a.first()).and_then(|x| x.f64_of(&key(&lp, "value")));
+                        if moved {
+                            outcome = Some((target, reached, at(&r, &dp, "stopped_by_loop"), at(&r, &dp, "stopped_by_contact")));
+                            break;
+                        }
+                        let mut w = at(&r, &dp, "reason").as_str().unwrap_or("it did not move").to_string();
+                        if let Some(l) = at(&r, &dp, "stopped_by_loop").str_of("joint") {
+                            w.push_str(&format!(" (the loop through `{l}`)"));
+                        }
+                        why_not.push(format!("to {target:.3} {unit}: {w}"));
+                    }
+                    Err(e) if e.ends_session() => return Outcome::lost(&e, &format!("driving {name}")),
+                    Err(e) => why_not.push(format!("to {target:.3} {unit}: {}", e.message())),
+                }
+            }
+            match outcome {
+                Some((target, reached, by_loop, by_contact)) => {
+                    driven += 1;
+                    c.set("result", "moves");
+                    c.set("driven_to", target);
+                    if let Some(x) = reached {
+                        c.set("reached", (x * 1e4).round() / 1e4);
+                    }
+                    if !by_loop.is_null() {
+                        c.set("stopped_by_loop", by_loop);
+                    }
+                    if !by_contact.is_null() {
+                        c.set("stopped_by_contact", by_contact);
+                    }
+                    // Back to where it was built.
+                    let _ = self.execute_op("drive", &obj! {"joint" => name.as_str(), "value" => v0, "quiet" => true}, dt);
+                }
+                None => {
+                    stuck += 1;
+                    c.set("result", "does not move");
+                    c.set("why", why_not.join("; "));
+                }
+            }
+            checks.push(c);
+        }
+        let dof_text: Vec<String> = dof.iter().map(|(d, n)| format!("{n} with {d}")).collect();
+        let note = format!(
+            "{driven} joint(s) driven, {stuck} would not move; {} conflict(s), {} error(s), {} floating chain(s); occurrences by degrees of freedom left: {}",
+            conflicts.len(),
+            errors.len(),
+            floating.len(),
+            if dof_text.is_empty() { "none listed".to_string() } else { dof_text.join(", ") }
+        );
+        let dof_json = {
+            let mut o = Json::obj();
+            for (d, n) in &dof {
+                o.set(&d.to_string(), *n as f64);
+            }
+            o
+        };
+        let fixed = at(&list, &lp, "fixed").as_array().map_or(0, <[Json]>::len);
+        let data = obj! {"dof" => dof_json, "fixed" => fixed as f64, "conflicts" => Json::Arr(conflicts), "errors" => Json::Arr(errors), "floating" => Json::Arr(floating), "joints" => Json::Arr(checks)};
+        Outcome { status: Status::Done, note, data, lost: None }
     }
 
     fn batching(&self) -> bool {
@@ -580,6 +734,7 @@ impl<'a> Runner<'a> {
                     let o = self.run_step(step, Some(error));
                     let mut sr = StepResult::new(step, o.status);
                     sr.note = o.note;
+                    sr.data = o.data;
                     sr.command = self.last_command.clone();
                     sr.ms = times.get(&failed).copied().unwrap_or(0.0) + t.elapsed().as_secs_f64() * 1000.0;
                     sr.calls = self.calls;
@@ -677,6 +832,7 @@ impl<'a> Runner<'a> {
             let o = self.run_step(step, None);
             let mut sr = StepResult::new(step, o.status);
             sr.note = o.note;
+            sr.data = o.data;
             sr.ms = t.elapsed().as_secs_f64() * 1000.0;
             sr.calls = self.calls;
             sr.command = self.last_command.clone();

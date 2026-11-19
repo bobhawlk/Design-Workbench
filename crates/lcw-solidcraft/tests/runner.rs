@@ -403,3 +403,68 @@ fn a_batch_that_hangs_is_a_timeout_like_any_call() {
     assert!(matches!(&failed[0].status, Status::Failed(e) if e.contains("batch of")), "{:?}", failed[0].status);
     assert!(runs[0].session_lost.is_some());
 }
+
+// ---- the mechanism check ----
+
+#[test]
+fn the_mechanism_check_drives_each_joint_and_reports_what_holds_it() {
+    let listed = obj! {
+        "dof" => vec![obj!{"occurrence" => 1, "dof" => 0}, obj!{"occurrence" => 2, "dof" => 1}, obj!{"occurrence" => 3, "dof" => 0}, obj!{"occurrence" => 4, "dof" => 6}],
+        "fixed" => vec![1],
+        "conflicts" => vec![obj!{"joint" => 9, "name" => "Lid stop", "why" => "off by 2 mm"}],
+        "errors" => Json::Arr(Vec::new()),
+        "floating" => vec![obj!{"occurrences" => vec!["Lamp:1"], "joints" => Json::Arr(Vec::new())}],
+        "joints" => vec![
+            obj!{"name" => "Hinge", "values" => vec![obj!{"name" => "angle", "value" => 0.0, "unit" => "deg", "limits" => vec![-30.0, 45.0]}]},
+            obj!{"name" => "Lid", "values" => vec![obj!{"name" => "angle", "value" => 0.0, "unit" => "deg", "limits" => Json::Null}]},
+            obj!{"name" => "Shut", "values" => vec![obj!{"name" => "angle", "value" => 0.0, "unit" => "deg", "limits" => vec![0.0, 0.0]}]},
+        ],
+    };
+    let moved = obj! {"moved" => true, "values" => vec![obj!{"name" => "angle", "value" => 5.0, "unit" => "deg"}]};
+    let stuck = obj! {"moved" => false, "reason" => "angle stopped where a closed loop can no longer close", "stopped_by_loop" => obj!{"joint" => "Lid stop", "fraction" => 0.0}};
+    // Hinge: there and back; Lid: stuck both ways.
+    let mut rec = Recorder::new()
+        .on("joint.list", Action::Answer(listed), 0)
+        .on("joint.drive", Action::Answer(moved.clone()), 2)
+        .on("joint.drive", Action::Answer(stuck), 2);
+    let design = DesignSteps {
+        name: "Box".into(),
+        file: "/out/Box.sc".into(),
+        steps: vec![
+            Step::tool("save", obj! {"path" => "/out/Box.sc"}, "save Box").group("save"),
+            Step::tool(
+                "verify_joints",
+                obj! {"joints" => vec![
+                    obj!{"name" => "Hinge", "type" => "revolute", "basis" => "geometry"},
+                    obj!{"name" => "Lid", "type" => "revolute", "basis" => "geometry"},
+                    obj!{"name" => "Shut", "type" => "revolute", "basis" => "geometry"},
+                    obj!{"name" => "Gone", "type" => "revolute", "basis" => "geometry"},
+                ]},
+                "check the mechanism",
+            )
+            .soft()
+            .group("verification"),
+        ],
+        notes: Vec::new(),
+    };
+    let profile = Profile::builtin();
+    let r = Runner::new(&mut rec, &profile).run(&design);
+    let v = &r.steps[1];
+    assert_eq!(v.status, Status::Done, "{:?}", v.status);
+    assert!(v.note.contains("1 joint(s) driven, 2 would not move; 1 conflict(s), 0 error(s), 1 floating chain(s)"), "{}", v.note);
+    assert!(v.note.contains("1 with 6"), "{}", v.note);
+    let checks = v.data.get("joints").and_then(Json::as_array).unwrap().to_vec();
+    let of = |n: &str| checks.iter().find(|c| c.str_of("joint") == Some(n)).unwrap().clone();
+    assert_eq!(of("Hinge").str_of("result"), Some("moves"));
+    assert_eq!(of("Hinge").f64_of("driven_to"), Some(5.0), "5 degrees up, inside its limits");
+    assert_eq!(of("Lid").str_of("result"), Some("does not move"));
+    assert!(of("Lid").str_of("why").unwrap().contains("the loop through `Lid stop`"), "{:?}", of("Lid"));
+    assert_eq!(of("Shut").str_of("result"), Some("no travel within its limits"));
+    assert!(of("Gone").str_of("result").unwrap().starts_with("not in the design"));
+    // Driven and driven back, then the stuck one tried both ways; names from the profile.
+    let drives: Vec<Json> = rec.calls.iter().filter(|(_, a)| a.str_of("command") == Some("joint.drive")).map(|(_, a)| a.get("params").cloned().unwrap()).collect();
+    assert_eq!(drives.len(), 4);
+    assert_eq!(drives[1].f64_of("value"), Some(0.0), "back where it was built");
+    assert_eq!(drives[3].f64_of("value"), Some(-5.0));
+    assert_eq!(v.data.get("floating").and_then(Json::as_array).map(<[Json]>::len), Some(1));
+}

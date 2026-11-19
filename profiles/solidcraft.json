@@ -20,7 +20,9 @@
     "find_limits":       {"command": "joint.find_limits",          "params": {"joint": "joint"}, "timeout_s": 900},
     "set_limits":        {"command": "joint.limits",               "params": {"joint": "joint", "index": "index", "min": "min", "max": "max"}},
     "parameter":         {"command": "parameters.change",          "params": {"name": "name", "expression": "expression", "comment": "comment"}},
-    "list_bodies":       {"command": "inspect.measure",            "params": {"names_only": "names_only"}}
+    "list_bodies":       {"command": "inspect.measure",            "params": {"names_only": "names_only"}},
+    "joint_list":        {"command": "joint.list",                 "params": {"quiet": "quiet"}},
+    "drive":             {"command": "joint.drive",                "params": {"joint": "joint", "value": "value", "quiet": "quiet"}}
   },
   "origin_forms": {
     "frame": {"point": "point", "z": "z", "x": "x", "occurrence": "occurrence", "path": "path"},
@@ -39,8 +41,16 @@
     },
     "still_running": {"marker": "still running:", "pending_tool": "pending", "done": "/done", "result": "/result", "cancel_tool": "cancel"}
   },
+  "verify": {
+    "about": "The mechanism check after the assembly is saved (`verify_joints`): `joint_list` once for the degrees of freedom, conflicts and floating chains, then each joint of a type in `drive_types` driven a little (`test_move`, within its limits) with `drive` and back. Pointers (starting /) and keys into SolidCraft's replies.",
+    "drive_types": ["revolute", "slider", "cylindrical"],
+    "test_move": {"deg": 5, "mm": 1},
+    "list": {"dof": "/dof", "dof_value": "dof", "dof_occurrence": "occurrence", "fixed": "/fixed", "conflicts": "/conflicts", "errors": "/errors", "floating": "/floating",
+             "chain_occurrences": "occurrences", "chain_joints": "joints", "problem_name": "name", "problem_why": "why",
+             "joints": "/joints", "joint_name": "name", "joint_values": "values", "value": "value", "value_limits": "limits", "value_unit": "unit"},
+    "drive": {"moved": "/moved", "reason": "/reason", "values": "/values", "stopped_by_loop": "/stopped_by_loop", "stopped_by_contact": "/stopped_by_contact", "conflicts": "/conflicts"}
+  },
   "fallbacks": {
-    "constraint": ["joint"],
     "rigid_group": ["joint"]
   }
 }

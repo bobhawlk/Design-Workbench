@@ -42,6 +42,9 @@ pub struct Profile {
     pub disabled: BTreeMap<String, String>,
     /// How the runner calls SolidCraft beyond `execute` (`runner`).
     pub runner: RunnerProfile,
+    /// How the mechanism check reads SolidCraft's answers (`verify`): JSON pointers and keys
+    /// into the replies of the `joint_list` and `drive` ops, and how far to drive each joint.
+    pub verify: Json,
 }
 
 /// The `runner` section: timeouts, the `batch` tool and the answer of a call still running.
@@ -135,7 +138,7 @@ impl RunnerProfile {
 impl Profile {
     pub fn builtin() -> Profile {
         // The built-in profile is checked by a test; a broken one cannot ship.
-        Profile::parse(BUILTIN).unwrap_or_else(|_| Profile { ops: BTreeMap::new(), fallbacks: BTreeMap::new(), tested_with: Vec::new(), disabled: BTreeMap::new(), runner: RunnerProfile::default() })
+        Profile::parse(BUILTIN).unwrap_or_else(|_| Profile { ops: BTreeMap::new(), fallbacks: BTreeMap::new(), tested_with: Vec::new(), disabled: BTreeMap::new(), runner: RunnerProfile::default(), verify: Json::Null })
     }
 
     pub fn parse(text: &str) -> Result<Profile, String> {
@@ -163,7 +166,8 @@ impl Profile {
             .unwrap_or_default();
         let tested_with = j.arr_of("tested_with").iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
         let runner = RunnerProfile::parse(j.get("runner"))?;
-        Ok(Profile { ops, fallbacks, tested_with, disabled: BTreeMap::new(), runner })
+        let verify = j.get("verify").cloned().unwrap_or(Json::Null);
+        Ok(Profile { ops, fallbacks, tested_with, disabled: BTreeMap::new(), runner, verify })
     }
 
     /// How long one call of `op` (or, without an op, of the session tool `tool`) may take:
@@ -317,10 +321,14 @@ mod tests {
         for op in p.ops.values() {
             cat.commands.insert(op.command.clone(), CommandInfo { enabled: true, ..Default::default() });
         }
+        cat.commands.remove("joint.rigid_group");
         cat.commands.remove("assembly.constraint.create");
         let report = p.check(&cat);
-        assert!(report.iter().any(|r| r.contains("constraint") && r.contains("instead")), "{report:?}");
-        assert_eq!(p.resolve("constraint"), Some("joint"));
+        assert!(report.iter().any(|r| r.contains("rigid_group") && r.contains("instead")), "{report:?}");
+        assert_eq!(p.resolve("rigid_group"), Some("joint"));
+        // A constraint has no fallback: a joint guessed from its rule frees or locks parts.
+        assert!(report.iter().any(|r| r.starts_with("constraint:") && r.contains("skipped")), "{report:?}");
+        assert_eq!(p.resolve("constraint"), None);
         assert_eq!(p.resolve("place"), Some("place"));
     }
 
