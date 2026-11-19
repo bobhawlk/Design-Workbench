@@ -421,7 +421,12 @@ impl<'a> Runner<'a> {
             let (stops, why) = match &by {
                 Json::Str(s) if s == "turn" => (false, "no contact within a turn".to_string()),
                 Json::Str(s) if s == "range" => (false, "no contact within the parts' reach".to_string()),
-                Json::Str(s) if s == "budget" => (true, "the search ran out of time before finding the stop; the value is the last one checked clear".to_string()),
+                // The last value checked clear is not a stop: as a limit it would hold the joint
+                // there (a lever left a few degrees of its travel).
+                Json::Str(s) if s == "budget" => (false, "the search ran out of time before finding the stop".to_string()),
+                // The closed loop the joint is in stops it; a limit of its own would lock the loop
+                // where the sweep of this one joint met it.
+                Json::Str(s) if s == "loop" => (false, "the closed loop it is in stops it, so it needs no limit of its own".to_string()),
                 Json::Str(s) => (true, format!("stopped by {s}")),
                 Json::Obj(_) => {
                     let names: Vec<&str> = ["a", "b"].iter().filter_map(|n| by.str_of(n)).collect();
@@ -434,7 +439,8 @@ impl<'a> Runner<'a> {
                 Some(v) => format!("{k} {v} ({why})"),
                 None => format!("{k} unknown ({why})"),
             };
-            (value, stops, text)
+            // Only a real stop makes an end of a limit.
+            (value.filter(|_| stops), stops, text)
         };
         let (min, min_stops, min_text) = side("min");
         let (max, max_stops, max_text) = side("max");
@@ -453,14 +459,7 @@ impl<'a> Runner<'a> {
         let t = self.profile.timeout_for(Some("set_limits"), "execute", self.timeout);
         let r = self.execute_op("set_limits", &obj! {"joint" => joint, "index" => 0, "min" => lo, "max" => hi}, t);
         match r {
-            Ok(_) => {
-                let guesses: Vec<&str> = [(&min_text, "min"), (&max_text, "max")].iter().filter(|(t, _)| t.contains("ran out of time")).map(|(_, k)| *k).collect();
-                let mut o = Outcome::of(Status::Done);
-                if !guesses.is_empty() {
-                    o.note = format!("{} end: {}", guesses.join(" and "), if guesses.len() == 1 { "the search ran out of time, so it is the last value checked clear" } else { "the search ran out of time, so they are the last values checked clear" });
-                }
-                o
-            }
+            Ok(_) => Outcome::of(Status::Done),
             Err(e) if e.ends_session() => Outcome::lost(&e, &format!("setting the limits of {jname}")),
             Err(e) => Outcome::of(Status::Failed(e.message().to_string())),
         }

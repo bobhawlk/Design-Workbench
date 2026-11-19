@@ -271,14 +271,18 @@ fn limits_run(found: Json) -> StepResult {
 
 #[test]
 fn limits_are_set_counted_and_reported_when_unknown() {
-    let set = limits_run(obj! {"min" => -30.0, "max" => 45.0, "min_by" => obj!{"a" => "Arm", "b" => "Base"}, "max_by" => "budget"});
+    let set = limits_run(obj! {"min" => -30.0, "max" => 45.0, "min_by" => obj!{"a" => "Arm", "b" => "Base"}, "max_by" => obj!{"a" => "Arm", "b" => "Stop"}});
     assert_eq!(set.status, Status::Done);
     assert_eq!(set.command, "joint.limits");
-    assert!(set.note.contains("max end") && set.note.contains("ran out of time"), "{}", set.note);
+    // The last value a search that ran out of time checked is not a stop, nor is a closed loop's.
+    let budget = limits_run(obj! {"min" => -30.0, "max" => 2.0, "min_by" => obj!{"a" => "Arm", "b" => "Base"}, "max_by" => "budget"});
+    assert!(matches!(&budget.status, Status::Skipped(w) if w.contains("one end unknown") && w.contains("ran out of time")), "{:?}", budget.status);
+    let looped = limits_run(obj! {"min" => -0.1, "max" => 0.1, "min_by" => "loop", "max_by" => "loop"});
+    assert!(matches!(&looped.status, Status::Skipped(w) if w.contains("closed loop")), "{:?}", looped.status);
     let one = limits_run(obj! {"min" => -30.0, "max" => Json::Null, "min_by" => obj!{"a" => "Arm", "b" => "Base"}, "max_by" => "range"});
     assert!(matches!(&one.status, Status::Skipped(w) if w.contains("one end unknown") && w.contains("max unknown") && w.contains("where Arm meets Base")), "{:?}", one.status);
     let free = limits_run(obj! {"min" => -180.0, "max" => 180.0, "min_by" => "turn", "max_by" => "turn"});
-    assert!(matches!(&free.status, Status::Skipped(w) if w.contains("turns freely")), "{:?}", free.status);
+    assert!(matches!(&free.status, Status::Skipped(w) if w.contains("nothing stops it")), "{:?}", free.status);
     let open = limits_run(obj! {"min" => Json::Null, "max" => Json::Null, "min_by" => "range", "max_by" => "range"});
     assert!(matches!(&open.status, Status::Skipped(w) if w.contains("nothing stops it")), "{:?}", open.status);
     let odd = limits_run(obj! {"index" => 0});
