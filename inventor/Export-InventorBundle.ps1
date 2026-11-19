@@ -76,7 +76,7 @@ Remove-Item -LiteralPath (Join-Path $OutFolder 'ready') -ErrorAction SilentlyCon
 
 # ---------------------------------------------------------------- helpers
 $cm = 10.0  # Inventor's API lengths are centimetres
-function P3($p) { if ($null -eq $p) { return $null }; @([double]$p.X * $cm, [double]$p.Y * $cm, [double]$p.Z * $cm) }
+function P3($p) { if ($null -eq $p) { return $null }; @(([double]$p.X * $cm), ([double]$p.Y * $cm), ([double]$p.Z * $cm)) }  # the brackets matter: in PowerShell a comma binds tighter than *
 function D3($v) { if ($null -eq $v) { return $null }; @([double]$v.X, [double]$v.Y, [double]$v.Z) }
 function Mat($m) {
   # Inventor matrices act on column vectors with the translation in column 4, as the bundle does.
@@ -97,7 +97,7 @@ function DocId($doc) {
   try { ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($name.ToLowerInvariant()))) -replace '-', '').Substring(0, 12).ToLowerInvariant() }
   finally { $sha.Dispose() }
 }
-function Perp($n) { $a = if ([math]::Abs($n[0]) -lt 0.9) { @(1, 0, 0) } else { @(0, 1, 0) }; $x = @(($n[1] * $a[2] - $n[2] * $a[1]), ($n[2] * $a[0] - $n[0] * $a[2]), ($n[0] * $a[1] - $n[1] * $a[0])); $l = [math]::Sqrt($x[0] * $x[0] + $x[1] * $x[1] + $x[2] * $x[2]); @($x[0] / $l, $x[1] / $l, $x[2] / $l) }
+function Perp($n) { $a = if ([math]::Abs($n[0]) -lt 0.9) { @(1, 0, 0) } else { @(0, 1, 0) }; $x = @(($n[1] * $a[2] - $n[2] * $a[1]), ($n[2] * $a[0] - $n[0] * $a[2]), ($n[0] * $a[1] - $n[1] * $a[0])); $l = [math]::Sqrt($x[0] * $x[0] + $x[1] * $x[1] + $x[2] * $x[2]); @(($x[0] / $l), ($x[1] / $l), ($x[2] / $l)) }
 
 # The outward normal of a planar face (its plane's normal, turned when the face is reversed).
 function FaceNormal($f) {
@@ -126,7 +126,7 @@ function Entity($e) {
       '^Edge(Proxy)?$' {
         $g = $e.Geometry
         if ([int]$e.GeometryType -in 5124, 5125) { $r.kind = 'edge'; $r.point = P3 $g.Center; $r.dir = D3 $g.Normal; $r.radius = [double]$g.Radius * $cm; $p = Perp $r.dir; $r.rim_point = @(($r.point[0] + $p[0] * $r.radius), ($r.point[1] + $p[1] * $r.radius), ($r.point[2] + $p[2] * $r.radius)) }
-        else { $r.kind = 'axis'; $r.point = P3 $e.StartVertex.Point; $d = $e.StopVertex.Point; $s = $e.StartVertex.Point; $v = @(($d.X - $s.X), ($d.Y - $s.Y), ($d.Z - $s.Z)); $l = [math]::Sqrt($v[0] * $v[0] + $v[1] * $v[1] + $v[2] * $v[2]); if ($l -gt 0) { $r.dir = @($v[0] / $l, $v[1] / $l, $v[2] / $l) } }
+        else { $r.kind = 'axis'; $r.point = P3 $e.StartVertex.Point; $d = $e.StopVertex.Point; $s = $e.StartVertex.Point; $v = @(($d.X - $s.X), ($d.Y - $s.Y), ($d.Z - $s.Z)); $l = [math]::Sqrt($v[0] * $v[0] + $v[1] * $v[1] + $v[2] * $v[2]); if ($l -gt 0) { $r.dir = @(($v[0] / $l), ($v[1] / $l), ($v[2] / $l)) } }
       }
       '^Vertex(Proxy)?$' { $r.kind = 'point'; $r.point = P3 $e.Point }
       '^WorkPlane(Proxy)?$' { $r.kind = 'plane'; $r.point = P3 $e.Plane.RootPoint; $r.dir = D3 $e.Plane.Normal }
