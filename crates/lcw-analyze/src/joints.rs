@@ -285,9 +285,16 @@ fn checked_pick(e: &EntityRef, to_world: &M4, faces: Option<&PlacedFaces>, tol: 
         EntityKind::Cylinder | EntityKind::Cone | EntityKind::Edge => {
             let Some(rim) = e.rim_point.map(|r| to_world.point(r)) else { return Err(format!("its {} has no point on a round edge in the export", e.kind.name())) };
             let along = |r: &Round, p: V3| (p - r.axis.origin).dot(r.axis.dir);
-            let on_face = |r: &Round| (r.axis.distance_to(rim) - r.radius).abs() < tol && along(r, rim) > r.lo - tol && along(r, rim) < r.hi + tol;
-            if faces.rounds.iter().any(on_face) {
+            let on_circle = |r: &Round| (r.axis.distance_to(rim) - r.radius).abs() < tol && along(r, rim) > r.lo - tol && along(r, rim) < r.hi + tol;
+            if faces.rounds.iter().any(|r| on_circle(r) && r.covers(rim, tol)) {
                 return Ok(Pick::Circle(rim));
+            }
+            // On the circle of a face that doesn't go all the way round (the arc of a slot), but
+            // off the arc: the exporter's rim point is the circle's, not the edge's. The same
+            // circle, picked on the arc at the same place along the axis (on a flat wall of the
+            // slot SolidCraft finds no round face).
+            if let Some(r) = faces.rounds.iter().find(|r| on_circle(r)) {
+                return Ok(Pick::Circle(r.point_at(along(r, rim), rim)));
             }
             // An edge of a different radius on the same axis (a counterbore's step, a cone): the
             // round face on that axis, picked in the same plane (SolidCraft's insert takes round faces).
@@ -307,12 +314,7 @@ fn checked_pick(e: &EntityRef, to_world: &M4, faces: Option<&PlacedFaces>, tol: 
                 Some(r) if (along(r, rim).clamp(r.lo, r.hi) - along(r, rim)).abs() > tol => {
                     Err(format!("its circle is {:.2} mm along the axis from the nearest round face of the part (a chamfer or countersink edge?)", (along(r, rim).clamp(r.lo, r.hi) - along(r, rim)).abs()))
                 }
-                Some(r) => {
-                    let t = along(r, rim).clamp(r.lo, r.hi);
-                    let on_axis = r.axis.origin + r.axis.dir * t;
-                    let radial = (rim - r.axis.project(rim)).unit().unwrap_or_else(|| r.axis.dir.any_perp());
-                    Ok(Pick::Circle(on_axis + radial * r.radius))
-                }
+                Some(r) => Ok(Pick::Circle(r.point_at(along(r, rim).clamp(r.lo, r.hi), rim))),
                 None => Err("no round face of the part passes through its rim point or lies on its axis".into()),
             }
         }
@@ -1040,7 +1042,7 @@ mod tests {
     fn part(rounds: &[(f64, f64, f64, bool, f64, f64)], lo: V3, hi: V3, flats: &[(V3, V3)]) -> PartFeatures {
         let mut f = PartFeatures::default();
         for &(x, y, r, hole, z0, z1) in rounds {
-            f.rounds.push(Round { axis: Axis::new(v3(x, y, 0.0), V3::Z).unwrap(), radius: r, lo: z0, hi: z1, hole, sweep: std::f64::consts::TAU });
+            f.rounds.push(Round { axis: Axis::new(v3(x, y, 0.0), V3::Z).unwrap(), radius: r, lo: z0, hi: z1, hole, sweep: std::f64::consts::TAU, mid: None });
         }
         for &(o, n) in flats {
             f.flats.push(Flat { origin: o, normal: n, area: 100.0 });

@@ -16,6 +16,9 @@ pub struct Round {
     pub hole: bool,
     /// How far round the face goes (radians, 2π for a full cylinder).
     pub sweep: f64,
+    /// For a face that does not go all the way round (the arc of a slot, a D-shaped hole): a
+    /// point on it, halfway round and halfway along, part frame. `None`: a full cylinder.
+    pub mid: Option<V3>,
 }
 
 impl Round {
@@ -25,7 +28,26 @@ impl Round {
         let a = m.point(self.axis.origin + self.axis.dir * self.lo);
         let b = m.point(self.axis.origin + self.axis.dir * self.hi);
         let (pa, pb) = ((a - axis.origin).dot(axis.dir), (b - axis.origin).dot(axis.dir));
-        Round { axis, radius: self.radius, lo: pa.min(pb), hi: pa.max(pb), hole: self.hole, sweep: self.sweep }
+        Round { axis, radius: self.radius, lo: pa.min(pb), hi: pa.max(pb), hole: self.hole, sweep: self.sweep, mid: self.mid.map(|p| m.point(p)) }
+    }
+    /// The direction from the axis to `p` is one the face covers (always, for a full cylinder):
+    /// a point on the circle of the face's radius can still be off a partial face, on the flat
+    /// wall of a slot.
+    pub fn covers(&self, p: V3, tol: f64) -> bool {
+        let Some(mid) = self.mid else { return true };
+        let (a, b) = (p - self.axis.project(p), mid - self.axis.project(mid));
+        match (a.unit(), b.unit()) {
+            (Some(a), Some(b)) => a.dot(b).clamp(-1.0, 1.0).acos() <= self.sweep / 2.0 + tol / self.radius.max(1e-9),
+            _ => false,
+        }
+    }
+    /// The point on the face at `along` (axis coordinate) in the direction of `toward` when the
+    /// face covers it, else halfway round the face.
+    pub fn point_at(&self, along: f64, toward: V3) -> V3 {
+        let on_axis = self.axis.origin + self.axis.dir * along;
+        let radial = |p: V3| (p - self.axis.project(p)).unit();
+        let dir = if self.covers(toward, 0.0) { radial(toward) } else { None }.or_else(|| self.mid.and_then(radial)).unwrap_or_else(|| self.axis.dir.any_perp());
+        on_axis + dir * self.radius
     }
     /// The middle of the face on the cylinder (for picking it).
     pub fn axial_mid(&self) -> f64 {
@@ -139,6 +161,7 @@ fn round_of(face: &Face, axis: &Axis, radius: f64) -> Option<Round> {
     let hole = !face.same_sense;
     // Sweep: full when bounded by whole circles (a single-vertex loop), else from the vertices.
     let full = face.loops.iter().any(|l| l.len() <= 1) || face.circles.iter().filter(|c| (c.2 - radius).abs() < 1e-6).count() >= 2 && face.vertices.len() <= 2;
+    let mut mid = None;
     let sweep = if full {
         std::f64::consts::TAU
     } else {
@@ -153,19 +176,29 @@ fn round_of(face: &Face, axis: &Axis, radius: f64) -> Option<Round> {
             })
             .collect();
         angles.sort_by(f64::total_cmp);
-        if angles.len() < 2 {
-            0.0
+        // Every vertex at one angle (or none off the axis): the face is bounded by its circles
+        // and a seam line, so it goes all the way round.
+        let seam = angles.last().zip(angles.first()).is_none_or(|(l, f)| l - f < 1e-9);
+        if seam {
+            std::f64::consts::TAU
         } else {
-            // The largest gap between consecutive angles is the part not covered.
-            let mut gap: f64 = 0.0;
+            // The largest gap between consecutive angles is the part not covered; the face
+            // starts where it ends.
+            let (mut gap, mut start): (f64, f64) = (0.0, angles[0]);
             for i in 0..angles.len() {
                 let next = if i + 1 < angles.len() { angles[i + 1] } else { angles[0] + std::f64::consts::TAU };
-                gap = gap.max(next - angles[i]);
+                if next - angles[i] > gap {
+                    gap = next - angles[i];
+                    start = next;
+                }
             }
-            std::f64::consts::TAU - gap
+            let sweep = std::f64::consts::TAU - gap;
+            let m = start + sweep / 2.0;
+            mid = Some(ax.origin + ax.dir * ((lo + hi) / 2.0) + (u * m.cos() + w * m.sin()) * radius);
+            sweep
         }
     };
-    Some(Round { axis: ax, radius, lo, hi, hole, sweep })
+    Some(Round { axis: ax, radius, lo, hi, hole, sweep, mid })
 }
 
 /// A point inside a planar face, away from its edges and holes, for picking it.
@@ -274,4 +307,46 @@ pub fn snap_to_bend(faces: &[Face], p: V3, tol: f64) -> V3 {
         }
     }
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lcw_geom::v3;
+
+    fn cylinder(vertices: Vec<V3>, loops: Vec<Vec<V3>>, circles: Vec<(V3, V3, f64)>) -> Face {
+        let axis = Axis::new(V3::ZERO, V3::Z).unwrap();
+        Face { surface: Surface::Cylinder { axis, radius: 2.0 }, same_sense: false, edges: Vec::new(), vertices, loops, circles }
+    }
+
+    #[test]
+    fn a_hole_with_a_seam_goes_all_the_way_round() {
+        // Two circles joined by a seam line: every vertex at one angle.
+        let (a, b) = (v3(2.0, 0.0, 0.0), v3(2.0, 0.0, 3.0));
+        let f = cylinder(vec![a, a, b, b], vec![vec![a, a, b, b]], vec![(V3::ZERO, V3::Z, 2.0), (v3(0.0, 0.0, 3.0), V3::Z, 2.0)]);
+        let r = round_of(&f, &Axis::new(V3::ZERO, V3::Z).unwrap(), 2.0).unwrap();
+        assert!((r.sweep - std::f64::consts::TAU).abs() < 1e-9 && r.mid.is_none(), "{r:?}");
+        assert!(r.covers(v3(-2.0, 0.0, 1.0), 0.01));
+    }
+
+    #[test]
+    fn the_arc_of_a_slot_covers_only_its_own_side() {
+        // The arc end of an invented slot: a quarter turn from +x to +y, 3 mm deep.
+        let (p, q) = (v3(2.0, 0.0, 0.0), v3(0.0, 2.0, 0.0));
+        let (p2, q2) = (v3(2.0, 0.0, 3.0), v3(0.0, 2.0, 3.0));
+        let f = cylinder(vec![p, q, q2, p2], vec![vec![p, q, q2, p2]], Vec::new());
+        let r = round_of(&f, &Axis::new(V3::ZERO, V3::Z).unwrap(), 2.0).unwrap();
+        assert!((r.sweep - std::f64::consts::FRAC_PI_2).abs() < 1e-9, "{r:?}");
+        let mid = r.mid.unwrap();
+        assert!((mid - v3(2f64.sqrt(), 2f64.sqrt(), 1.5)).norm() < 1e-9, "{mid:?}");
+        // A point on the slot's circle but on its flat side is not on the face.
+        assert!(r.covers(v3(1.0, 1.0, 0.0), 0.01));
+        assert!(!r.covers(v3(0.0, -2.0, 0.0), 0.01));
+        // Picked on the arc at the same place along the axis instead.
+        let at = r.point_at(0.0, v3(0.0, -2.0, 0.0));
+        assert!((at - v3(2f64.sqrt(), 2f64.sqrt(), 0.0)).norm() < 1e-9, "{at:?}");
+        // Moved with the part.
+        let m = M4::translation(v3(10.0, 0.0, 0.0));
+        assert!((r.transformed(&m).mid.unwrap() - (mid + v3(10.0, 0.0, 0.0))).norm() < 1e-9);
+    }
 }
