@@ -70,6 +70,18 @@ While it builds, inv2sc prints a line per step (at most a few a second) and keep
 
 `inventor\Run-BuildSteps.ps1 -Steps build-steps.json` runs a `build-steps.json` with only PowerShell and SolidCraft. Use it where inv2sc isn't built, or with `inv2sc convert --dry-run --path-map FROM=TO` steps made on another machine.
 
+## Verifying a build
+
+`inv2sc verify <bundle> --built <folder convert wrote>` checks a finished build against the bundle it came from, independently of the converter: it asks SolidCraft what it holds and compares that with what the bundle says Inventor had.
+
+1. **Part designs.** Every part document with a STEP has a saved design; its volume and bounding box match SolidCraft's own import of that STEP (0.1 % and 0.05 mm), and Inventor's volume and range box when the bundle carries them (0.5 % and 1 mm or 1 % of the diagonal: the range box is not tight on curved parts). A volume out by the same factor on every part is reported as a units problem.
+2. **Placements.** Every placed occurrence, through sub-assemblies to any depth, is present exactly once, in the sub-assembly Inventor has it in, at its position and orientation. The expected world placement is the product of the bundle's matrices down the path, computed by the checker. Each built instance is measured in the world by SolidCraft (centre of mass, inertia, box) and judged against the part's own STEP placed by that matrix, besides its frame being compared; a frame that differs while the geometry coincides (a symmetric part) is listed, not failed. Missing, extra and misplaced ones are reported with the distance and angle.
+3. **Names.** Occurrences and designs carry the Inventor names.
+4. **Overall.** Part count, and the world bounding box against the one the bundle's placements give.
+5. **Interference.** SolidCraft's own check on the closed bodies: information, since the source may clash itself. A pair is suspect when a large part of the smaller body is inside the other and one of the two is not where Inventor has it.
+
+It writes `verification-report.md` and `verification.json` (to `--out`, default the built folder), prints one summary line and exits 1 when a check fails. Every SolidCraft command, tool and answer key it uses is in `profiles/solidcraft.json` (`verify_*` ops and the `verify` section). A full check of a 190-part assembly takes about 15 minutes, most of it the interference check (`--clash-budget`, `--no-clash`).
+
 ## Staying compatible
 
 SolidCraft is young and moves fast. Its own contributor rules say a command may change, and its plugin API is 0.x. inv2sc depends on as little as it can:

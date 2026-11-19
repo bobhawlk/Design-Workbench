@@ -22,7 +22,22 @@
     "parameter":         {"command": "parameters.change",          "params": {"name": "name", "expression": "expression", "comment": "comment"}},
     "list_bodies":       {"command": "inspect.measure",            "params": {"names_only": "names_only"}},
     "joint_list":        {"command": "joint.list",                 "params": {"quiet": "quiet"}},
-    "drive":             {"command": "joint.drive",                "params": {"joint": "joint", "value": "value", "quiet": "quiet"}}
+    "drive":             {"command": "joint.drive",                "params": {"joint": "joint", "value": "value", "quiet": "quiet"}},
+    "verify_open":       {"tool": "open",                             "params": {"path": "path"}},
+    "verify_measure":    {"tool": "measure",                          "params": {"summary": "summary"}},
+    "list_components":   {"command": "component.list",             "params": {"compact": "compact", "bodies": "bodies"}},
+    "component_links":   {"command": "component.links",            "params": {}},
+    "occurrence_props":  {"command": "occurrence.properties",      "params": {"occurrence": "occurrence", "path": "path", "descendants": "descendants"}},
+    "interference":      {"command": "inspect.interference",       "params": {"bodies": "bodies", "budget_s": "budget_s", "exclude_pairs": "exclude_pairs"}, "timeout_s": 3600}
+  },
+  "verify": {
+    "about": "How `inv2sc verify` reads SolidCraft's answers (JSON pointers; matrices are row-vector: the translation is the last row). Written against SolidCraft 0.44.",
+    "open_result": {"name": "name", "bodies": "bodies"},
+    "components": {"list": "components", "id": "id", "name": "name", "children": "children", "occurrences": "occurrences", "occurrence_id": "id", "occurrence_name": "name", "transform": "transform"},
+    "links": {"list": "links", "component": "component", "file": "file", "found": "found"},
+    "props": {"bodies": "bodies", "closed": "closed", "total": "total", "volume": "volume_mm3", "mass": "mass_g", "com": "center_of_mass", "inertia": "inertia_g_mm2", "bbox": "bbox", "open_skipped": "open_bodies_skipped"},
+    "measure": {"bodies": "bodies", "name": "name", "closed": "closed", "volume": "volume_mm3", "bbox": "bbox"},
+    "interference": {"pairs": "interferences", "a": "a", "b": "b", "volume": "volume_mm3", "unchecked": "unchecked", "budget_exceeded": "budget_exceeded", "a_part": "a_part", "b_part": "b_part", "path": "path", "bbox": "bbox"}
   },
   "origin_forms": {
     "frame": {"point": "point", "z": "z", "x": "x", "occurrence": "occurrence", "path": "path"},
@@ -41,7 +56,7 @@
     },
     "still_running": {"marker": "still running:", "pending_tool": "pending", "done": "/done", "result": "/result", "cancel_tool": "cancel"}
   },
-  "verify": {
+  "mechanism": {
     "about": "The mechanism check after the assembly is saved (`verify_joints`): `joint_list` once for the degrees of freedom, conflicts and floating chains, then each joint of a type in `drive_types` driven a little (`test_move`, within its limits) with `drive` and back. Pointers (starting /) and keys into SolidCraft's replies.",
     "drive_types": ["revolute", "slider", "cylindrical"],
     "test_move": {"deg": 5, "mm": 1},

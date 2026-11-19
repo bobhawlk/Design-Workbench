@@ -22,6 +22,7 @@ dependencies = [
  "lcw-json",
  "lcw-solidcraft",
  "lcw-step",
+ "lcw-verify",
 ]
 
 [[package]]
@@ -56,4 +57,15 @@ version = "0.1.0"
 dependencies = [
  "lcw-geom",
  "lcw-json",
+]
+
+[[package]]
+name = "lcw-verify"
+version = "0.1.0"
+dependencies = [
+ "lcw-bundle",
+ "lcw-geom",
+ "lcw-json",
+ "lcw-solidcraft",
+ "lcw-step",
 ]

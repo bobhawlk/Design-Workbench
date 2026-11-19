@@ -467,11 +467,11 @@ impl<'a> Runner<'a> {
 
     /// Check the mechanism SolidCraft solved: degrees of freedom, conflicts and floating chains
     /// from `joint_list`, then each joint of `joints` (`{name, type, basis}`) driven a little
-    /// within its limits and back. Every name it reads is in the profile's `verify` section.
+    /// within its limits and back. Every name it reads is in the profile's `mechanism` section.
     fn verify_joints(&mut self, args: &Json) -> Outcome {
-        let v = self.profile.verify.clone();
+        let v = self.profile.mechanism.clone();
         let (Some(lp), Some(dp)) = (v.get("list").cloned(), v.get("drive").cloned()) else {
-            return Outcome::of(Status::Skipped("the profile has no `verify` section".into()));
+            return Outcome::of(Status::Skipped("the profile has no `mechanism` section".into()));
         };
         let key = |j: &Json, k: &str| j.str_of(k).unwrap_or(k).to_string();
         let at = |r: &Json, sec: &Json, k: &str| -> Json { r.pointer(&key(sec, k)).cloned().unwrap_or(Json::Null) };
