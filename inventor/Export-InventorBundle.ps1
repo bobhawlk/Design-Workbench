@@ -44,7 +44,9 @@ try { $inv = [Runtime.InteropServices.Marshal]::GetActiveObject('Inventor.Applic
 catch { Write-Error 'Inventor is not running. Start Inventor, open the assembly, and try again.'; exit 21 }
 
 # Inventor's interop assembly gives enum names; without it we fall back to numbers.
-$interop = Get-ChildItem -Path (Join-Path ([IO.Path]::GetDirectoryName($inv.InstallPath)) '*') -Recurse -Filter 'Autodesk.Inventor.Interop.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
+$interop = $null
+try { $bin = Split-Path (Get-Process Inventor | Select-Object -First 1).Path; $interop = Get-Item -LiteralPath (Join-Path $bin 'Autodesk.Inventor.Interop.dll') -ErrorAction SilentlyContinue } catch { }
+if (-not $interop) { $interop = Get-ChildItem -Path (Join-Path ([IO.Path]::GetDirectoryName($inv.InstallPath)) '*') -Recurse -Filter 'Autodesk.Inventor.Interop.dll' -ErrorAction SilentlyContinue | Select-Object -First 1 }
 if (-not $interop) { $interop = Get-ChildItem 'C:\Program Files\Autodesk\Inventor*\Bin\Public Assemblies\Autodesk.Inventor.Interop.dll' -ErrorAction SilentlyContinue | Select-Object -First 1 }
 $haveEnums = $false
 if ($interop) { try { Add-Type -Path $interop.FullName; $haveEnums = $true } catch { } }
@@ -132,7 +134,7 @@ function Entity($e) {
       '^WorkPoint(Proxy)?$' { $r.kind = 'point'; $r.point = P3 $e.Point }
       default { }
     }
-  } catch { }
+  } catch { $r.error = "$t`: $($_.Exception.Message) [$($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())]" }
   $r
 }
 function OccPath($occ) {
@@ -188,7 +190,16 @@ function SheetMetal($doc, $id) {
     $rule = if ($cd.UseSheetMetalStyleUnfoldMethod) { $style.UnfoldMethod } else { $cd.UnfoldMethod }
     if ($rule) {
       $sm.unfold_method = if ([int]$rule.UnfoldMethodType -eq 28673) { 'linear' } else { (EnumName 'UnfoldMethodTypeEnum' $rule.UnfoldMethodType) }
-      if ([int]$rule.UnfoldMethodType -eq 28673) { try { $sm.k_factor = [double]$u.GetValueFromExpression([string]$rule.kFactor, '') } catch { try { $sm.k_factor = [double]$rule.kFactor } catch { } } }
+      if ([int]$rule.UnfoldMethodType -eq 28673) {
+        # kFactor is an expression such as "0.44 ul"; record the text too so a failure can be seen.
+        $kx = $null; try { $kx = [string]$rule.kFactor } catch { $sm.k_factor_error = $_.Exception.Message }
+        if ($kx) {
+          $sm.k_factor_expression = $kx
+          try { $sm.k_factor = [double]$u.GetValueFromExpression($kx, 'ul') } catch {
+            if ($kx -match '^\s*([0-9]*\.?[0-9]+)') { $sm.k_factor = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture) }
+          }
+        }
+      }
     }
   } catch { Warn "$($doc.DisplayName): could not read its sheet metal rule ($($_.Exception.Message))" }
   # Bends of the folded part: a point on each bend's face (what SolidCraft's convert picks).
@@ -279,7 +290,7 @@ function AddDocument($doc, [bool]$Geometry = $true) {
     try {
       foreach ($dp in $doc.ComponentDefinition.ReferenceComponents.DerivedPartComponents) {
         $src = $dp.ReferencedDocumentDescriptor.ReferencedDocument
-        if ($src) { $sid = AddDocument $src $false; $mir = $false; try { $mir = [int]$dp.Definition.MirrorPlane -ne 0 } catch { }; $d.derived = [ordered]@{ source = $sid; mirrored = $mir }; break }
+        if ($src) { $sid = AddDocument $src $false; $mir = $false; $mp = $null; try { $mp = [int]$dp.Definition.MirrorPlane; $mn = EnumName 'DerivedComponentMirrorPlaneEnum' $mp; $mir = ($mn -notmatch 'None') -and ($mn -ne [string]$mp) } catch { }; $d.derived = [ordered]@{ source = $sid; mirrored = $mir; mirror_plane = $mp }; break }
       }
     } catch { }
   }
