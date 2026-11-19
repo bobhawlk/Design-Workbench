@@ -284,10 +284,36 @@ fn checked_pick(e: &EntityRef, to_world: &M4, faces: Option<&PlacedFaces>, tol: 
         }
         EntityKind::Cylinder | EntityKind::Cone | EntityKind::Edge => {
             let Some(rim) = e.rim_point.map(|r| to_world.point(r)) else { return Err(format!("its {} has no point on a round edge in the export", e.kind.name())) };
-            if faces.rounds.iter().any(|r| (r.axis.distance_to(rim) - r.radius).abs() < tol) {
-                Ok(Pick::Circle(rim))
-            } else {
-                Err("no round face of the part passes through its rim point".into())
+            let along = |r: &Round, p: V3| (p - r.axis.origin).dot(r.axis.dir);
+            let on_face = |r: &Round| (r.axis.distance_to(rim) - r.radius).abs() < tol && along(r, rim) > r.lo - tol && along(r, rim) < r.hi + tol;
+            if faces.rounds.iter().any(on_face) {
+                return Ok(Pick::Circle(rim));
+            }
+            // An edge of a different radius on the same axis (a counterbore's step, a cone): the
+            // round face on that axis, picked in the same plane (SolidCraft's insert takes round faces).
+            let axis = e.dir.and_then(|d| Axis::new(to_world.point(e.point), to_world.dir(d)));
+            let coaxial = axis.and_then(|ax| {
+                faces.rounds.iter().filter(|r| r.axis.coincident(&ax, tol.max(0.01) * 4.0)).min_by(|x, y| {
+                    let gap = |r: &Round| {
+                        let t = along(r, rim);
+                        if t < r.lo { r.lo - t } else if t > r.hi { t - r.hi } else { 0.0 }
+                    };
+                    gap(x).total_cmp(&gap(y))
+                })
+            });
+            match coaxial {
+                // Only across the axis: picking another end of the face would move the insert's
+                // plane, and SolidCraft would then place the part off where Inventor has it.
+                Some(r) if (along(r, rim).clamp(r.lo, r.hi) - along(r, rim)).abs() > tol => {
+                    Err(format!("its circle is {:.2} mm along the axis from the nearest round face of the part (a chamfer or countersink edge?)", (along(r, rim).clamp(r.lo, r.hi) - along(r, rim)).abs()))
+                }
+                Some(r) => {
+                    let t = along(r, rim).clamp(r.lo, r.hi);
+                    let on_axis = r.axis.origin + r.axis.dir * t;
+                    let radial = (rim - r.axis.project(rim)).unit().unwrap_or_else(|| r.axis.dir.any_perp());
+                    Ok(Pick::Circle(on_axis + radial * r.radius))
+                }
+                None => Err("no round face of the part passes through its rim point or lies on its axis".into()),
             }
         }
         EntityKind::Axis => match e.dir.and_then(|d| to_world.dir(d).unit()) {
@@ -399,7 +425,7 @@ pub fn plan(model: &Model, instances: &[Inst], features: &[Option<PartFeatures>]
             asm_places.push((x.def, x.path.clone(), x.world));
         }
     }
-    // Parts a SolidCraft constraint or an Inventor joint already holds: inference leaves them.
+    // Parts an Inventor joint already holds: inference leaves them.
     let mut constrained: BTreeSet<Vec<usize>> = BTreeSet::new();
     let mut sub_grounds: Vec<String> = Vec::new();
     for (def, base, world) in &asm_places {
@@ -412,22 +438,43 @@ pub fn plan(model: &Model, instances: &[Inst], features: &[Option<PartFeatures>]
             let a: Vec<usize> = base.iter().copied().chain(ka).collect();
             let b: Vec<usize> = base.iter().copied().chain(kb).collect();
             let mut ev = Evidence { name: c.name.clone(), assembly: d.name.clone(), kind: c.kind.clone(), a: a.clone(), b: b.clone(), why_not: String::new(), outcome: String::new() };
+            if a.len() == base.len() || b.len() == base.len() {
+                ev.why_not = "one side is the assembly's own geometry (an origin plane or axis), not a part".into();
+                out.evidence.push(ev);
+                continue;
+            }
             if a == b || a.starts_with(&b) || b.starts_with(&a) {
                 ev.why_not = "both sides are on the same occurrence".into();
                 out.evidence.push(ev);
                 continue;
             }
+            // A side the export names by its sub-assembly: the part below it the geometry lands on.
+            let pick_on = |e: &EntityRef, path: &Vec<usize>| -> Result<(Vec<usize>, Pick), String> {
+                let direct = checked_pick(e, world, faces_of(path).as_ref(), opts.pick_tol);
+                if direct.is_ok() || !inst_index.get(path).is_some_and(|i| model.defs[instances[*i].def].assembly) {
+                    return direct.map(|p| (path.clone(), p));
+                }
+                let leaves: Vec<&Inst> = instances.iter().filter(|x| x.path.len() > path.len() && x.path.starts_with(path) && !model.defs[x.def].assembly).collect();
+                let hits: Vec<(Vec<usize>, Pick)> = leaves.iter().filter_map(|x| checked_pick(e, world, faces_of(&x.path).as_ref(), opts.pick_tol).ok().map(|p| (x.path.clone(), p))).collect();
+                match hits.len() {
+                    1 => hits.into_iter().next().ok_or_else(String::new),
+                    0 => Err(format!("it names a sub-assembly, and its geometry lands on none of the {} part(s) in it", leaves.len())),
+                    k => Err(format!("it names a sub-assembly, and its geometry lands on {k} of the parts in it")),
+                }
+            };
             let usable = (|| -> Result<ConstraintPlan, String> {
-                let pa = checked_pick(&c.a, world, faces_of(&a).as_ref(), opts.pick_tol).map_err(|e| format!("first side: {e}"))?;
-                let pb = checked_pick(&c.b, world, faces_of(&b).as_ref(), opts.pick_tol).map_err(|e| format!("second side: {e}"))?;
-                constraint_plan(c, RefPlan { path: a.clone(), pick: pa }, RefPlan { path: b.clone(), pick: pb })
+                let (pa_path, pa) = pick_on(&c.a, &a).map_err(|e| format!("first side: {e}"))?;
+                let (pb_path, pb) = pick_on(&c.b, &b).map_err(|e| format!("second side: {e}"))?;
+                if pa_path == pb_path {
+                    return Err("both sides land on the same part".into());
+                }
+                constraint_plan(c, RefPlan { path: pa_path, pick: pa }, RefPlan { path: pb_path, pick: pb })
             })();
             match usable {
-                Ok(p) => {
-                    constrained.insert(a);
-                    constrained.insert(b);
-                    out.constraints.push(p);
-                }
+                // The inference still covers these parts: the constraints hold them as Inventor
+                // did, and the inferred holds and joints agree with them as built, so a group of
+                // constrained parts is never left joined to nothing grounded.
+                Ok(p) => out.constraints.push(p),
                 Err(why) => {
                     ev.why_not = why;
                     out.evidence.push(ev);
