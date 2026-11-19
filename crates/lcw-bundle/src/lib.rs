@@ -332,7 +332,50 @@ impl Bundle {
         let json = Json::parse(&text).map_err(|e| BundleError(format!("{}: {e}", file.display())))?;
         let mut b = Bundle::from_json(&json)?;
         b.folder = file.parent().map(Path::to_path_buf);
+        b.prune();
         Ok(b)
+    }
+
+    /// Drop what the exporter recorded but left out of the model, and say so in `warnings`:
+    /// suppressed occurrences with no document, and constraints, joints and pattern elements that
+    /// name an occurrence which is hidden, suppressed or whose file is missing. A real assembly
+    /// nearly always has some; they are not a reason to refuse it.
+    pub fn prune(&mut self) {
+        let known: std::collections::BTreeSet<String> = self.documents.iter().map(|d| d.id.clone()).collect();
+        let mut notes = Vec::new();
+        for d in &mut self.documents {
+            let before = d.occurrences.len();
+            d.occurrences.retain(|o| known.contains(&o.document) || !(o.suppressed || o.document.is_empty()));
+            let left_out = before - d.occurrences.len();
+            if left_out > 0 {
+                notes.push(format!("{}: {left_out} suppressed occurrence(s) left out", d.name));
+            }
+            let occ: std::collections::BTreeSet<String> = d.occurrences.iter().map(|o| o.id.clone()).collect();
+            let absent = |path: &Vec<String>| path.first().is_some_and(|p| !occ.contains(p));
+            let mut missing: BTreeMap<String, usize> = BTreeMap::new();
+            let mut count = |path: &Vec<String>, missing: &mut BTreeMap<String, usize>| {
+                if let Some(p) = path.first().filter(|p| !occ.contains(*p)) {
+                    *missing.entry(p.clone()).or_default() += 1;
+                }
+            };
+            for c in &d.constraints {
+                count(&c.a.path, &mut missing);
+                count(&c.b.path, &mut missing);
+            }
+            for j in &d.joints {
+                count(&j.a.path, &mut missing);
+                count(&j.b.path, &mut missing);
+            }
+            d.constraints.retain(|c| !absent(&c.a.path) && !absent(&c.b.path));
+            d.joints.retain(|j| !absent(&j.a.path) && !absent(&j.b.path));
+            for p in &mut d.patterns {
+                p.elements.retain(|e| !absent(e));
+            }
+            for (name, n) in missing {
+                notes.push(format!("{}: {n} constraint or joint reference(s) to `{name}`, which is not in the model (hidden, suppressed or missing), left out", d.name));
+            }
+        }
+        self.warnings.extend(notes);
     }
 
     pub fn write(&self, folder: &Path) -> Result<(), BundleError> {

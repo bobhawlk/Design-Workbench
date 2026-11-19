@@ -147,6 +147,15 @@ function OccPath($occ) {
 $docs = [ordered]@{}           # id -> bundle document
 $docObjects = @{}              # id -> Inventor document
 
+# Where the time goes: seconds per kind of work, and per part, written to export-timing.txt.
+$clock = [Diagnostics.Stopwatch]::StartNew()
+$phase = [ordered]@{ step = 0.0; sheet_metal = 0.0; mass = 0.0 }
+$partTimes = [Collections.Generic.List[object]]::new()
+function Timed([string]$kind, [scriptblock]$body) {
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  try { & $body } finally { $phase[$kind] += $sw.Elapsed.TotalSeconds }
+}
+
 function ExportStep($doc, $file) {
   $target = Join-Path $partsDir $file
   if ((Test-Path -LiteralPath $target) -and ((Get-Item -LiteralPath $target).LastWriteTimeUtc -gt [IO.File]::GetLastWriteTimeUtc($doc.FullFileName))) { return }
@@ -155,7 +164,11 @@ function ExportStep($doc, $file) {
   $ctx = $inv.TransientObjects.CreateTranslationContext()
   $ctx.Type = 13059   # kFileBrowseIOMechanism
   $opts = $inv.TransientObjects.CreateNameValueMap()
-  if ($addin.HasSaveCopyAsOptions($doc, $ctx, $opts)) { $opts.Add('ApplicationProtocolType', $StepProtocol) }
+  if ($addin.HasSaveCopyAsOptions($doc, $ctx, $opts)) {
+    # The translator fills the map with its defaults, so the entry already exists: NameValueMap.Add
+    # on an existing name fails with a bare E_FAIL. Set the value instead.
+    $opts.Value('ApplicationProtocolType') = $StepProtocol
+  }
   $medium = $inv.TransientObjects.CreateDataMedium()
   $medium.FileName = $target
   $addin.SaveCopyAs($doc, $ctx, $opts, $medium)
@@ -218,9 +231,36 @@ function SheetMetal($doc, $id) {
   $sm
 }
 
-function AddDocument($doc) {
+# $Geometry is false for a document reached only as the source of a derived part (often a large
+# master model): it is recorded by name, with no STEP and no mass, unless the assembly also places it.
+function AddGeometry($doc, $d, $id) {
+  $name = $d.name
+  $t0 = $clock.Elapsed.TotalSeconds
+  try {
+    $null = Timed 'mass' {
+      $mp = $doc.ComponentDefinition.MassProperties
+      $box = $doc.ComponentDefinition.RangeBox
+      $d.mass = [ordered]@{ volume_mm3 = [double]$mp.Volume * 1000; area_mm2 = [double]$mp.Area * 100; bbox_min = P3 $box.MinPoint; bbox_max = P3 $box.MaxPoint }
+    }
+  } catch { }
+  if ($d.kind -ne 'part') { return }
+  $file = "$id.stp"
+  try { $null = Timed 'step' { ExportStep $doc $file }; $d.step = "parts/$file" } catch { Warn "$name`: STEP export failed ($($_.Exception.Message))" }
+  if ($doc.SubType -ieq $SheetSubtype) {
+    try { $null = Timed 'sheet_metal' { $d.sheet_metal = SheetMetal $doc $id } } catch { Warn "$name`: sheet metal data could not be read ($($_.Exception.Message))" }
+  }
+  $took = $clock.Elapsed.TotalSeconds - $t0
+  $partTimes.Add([pscustomobject]@{ Name = $name; Seconds = $took })
+  Write-Host ("  part {0} ({1:n1} s)" -f $name, $took)
+  $d.has_geometry = $true
+}
+
+function AddDocument($doc, [bool]$Geometry = $true) {
   $id = DocId $doc
-  if ($docs.Contains($id)) { return $id }
+  if ($docs.Contains($id)) {
+    if ($Geometry -and -not $docs[$id].has_geometry -and $docs[$id].kind -eq 'part') { AddGeometry $doc $docs[$id] $id }
+    return $id
+  }
   $isAsm = [int]$doc.DocumentType -eq 12291
   $name = [IO.Path]::GetFileNameWithoutExtension($doc.FullFileName)
   $d = [ordered]@{ id = $id; kind = $(if ($isAsm) { 'assembly' } else { 'part' }); name = $name; file = $doc.FullFileName
@@ -230,25 +270,16 @@ function AddDocument($doc) {
   foreach ($k in 'Title', 'Author', 'Comments') { $v = Prop $doc 'Inventor Summary Information' $k; if ($v) { $d.properties[$k] = $v } }
   $docs[$id] = $d
   $docObjects[$id] = $doc
-  try {
-    $mp = $doc.ComponentDefinition.MassProperties
-    $box = $doc.ComponentDefinition.RangeBox
-    $d.mass = [ordered]@{ volume_mm3 = [double]$mp.Volume * 1000; area_mm2 = [double]$mp.Area * 100; bbox_min = P3 $box.MinPoint; bbox_max = P3 $box.MaxPoint }
-  } catch { }
   if ($isAsm) {
+    AddGeometry $doc $d $id
     $d.occurrences = @(); $d.constraints = @(); $d.joints = @(); $d.patterns = @()
     ReadAssembly $doc $d
   } else {
-    $file = "$id.stp"
-    Write-Host "  part $name"
-    try { ExportStep $doc $file; $d.step = "parts/$file" } catch { Warn "$name`: STEP export failed ($($_.Exception.Message))" }
-    if ($doc.SubType -ieq $SheetSubtype) {
-      try { $d.sheet_metal = SheetMetal $doc $id } catch { Warn "$name`: sheet metal data could not be read ($($_.Exception.Message))" }
-    }
+    if ($Geometry) { AddGeometry $doc $d $id }
     try {
       foreach ($dp in $doc.ComponentDefinition.ReferenceComponents.DerivedPartComponents) {
         $src = $dp.ReferencedDocumentDescriptor.ReferencedDocument
-        if ($src) { $sid = AddDocument $src; $mir = $false; try { $mir = [int]$dp.Definition.MirrorPlane -ne 0 } catch { }; $d.derived = [ordered]@{ source = $sid; mirrored = $mir }; break }
+        if ($src) { $sid = AddDocument $src $false; $mir = $false; try { $mir = [int]$dp.Definition.MirrorPlane -ne 0 } catch { }; $d.derived = [ordered]@{ source = $sid; mirrored = $mir }; break }
       }
     } catch { }
   }
@@ -319,6 +350,7 @@ function ReadAssembly($doc, $d) {
 }
 
 $rootId = AddDocument $root
+foreach ($d in $docs.Values) { $d.Remove('has_geometry') }
 $bundle = [ordered]@{
   schema = $Schema
   source = [ordered]@{ app = 'Autodesk Inventor'; app_version = [string]$inv.SoftwareVersion.DisplayVersion; exporter = $ExporterVersion; exported_at = (Get-Date).ToUniversalTime().ToString('o'); root_file = $rootFile }
@@ -326,7 +358,54 @@ $bundle = [ordered]@{
   documents = @($docs.Values)
   warnings = @($warnings)
 }
-$json = $bundle | ConvertTo-Json -Depth 64 -Compress
+# Our own JSON writer. Windows PowerShell 5.1's ConvertTo-Json writes an array that came back from a
+# function as {"value":[...],"Count":n}, which is what broke every placement matrix; it is also slow
+# and has a depth limit.
+$inv_culture = [Globalization.CultureInfo]::InvariantCulture
+function WriteJson($sb, $v) {
+  if ($null -eq $v) { [void]$sb.Append('null'); return }
+  if ($v -is [string] -or $v -is [char]) {
+    [void]$sb.Append('"')
+    foreach ($c in ([string]$v).ToCharArray()) {
+      $n = [int]$c
+      if ($c -eq '"') { [void]$sb.Append('\"') } elseif ($c -eq '\') { [void]$sb.Append('\\') }
+      elseif ($n -lt 32) { [void]$sb.Append(('\u{0:x4}' -f $n)) } else { [void]$sb.Append($c) }
+    }
+    [void]$sb.Append('"'); return
+  }
+  if ($v -is [bool]) { [void]$sb.Append($(if ($v) { 'true' } else { 'false' })); return }
+  if ($v -is [double] -or $v -is [single]) {
+    $d = [double]$v
+    if ([double]::IsNaN($d) -or [double]::IsInfinity($d)) { [void]$sb.Append('null') } else { [void]$sb.Append($d.ToString('R', $inv_culture)) }
+    return
+  }
+  if ($v -is [int] -or $v -is [long] -or $v -is [int16] -or $v -is [byte] -or $v -is [uint32] -or $v -is [uint64] -or $v -is [decimal]) { [void]$sb.Append(([IConvertible]$v).ToString($inv_culture)); return }
+  if ($v -is [Collections.IDictionary]) {
+    [void]$sb.Append('{'); $first = $true
+    foreach ($k in @($v.Keys)) {
+      if (-not $first) { [void]$sb.Append(',') }; $first = $false
+      WriteJson $sb ([string]$k); [void]$sb.Append(':'); WriteJson $sb $v[$k]
+    }
+    [void]$sb.Append('}'); return
+  }
+  if ($v -is [Collections.IEnumerable]) {
+    [void]$sb.Append('['); $first = $true
+    foreach ($item in $v) { if (-not $first) { [void]$sb.Append(',') }; $first = $false; WriteJson $sb $item }
+    [void]$sb.Append(']'); return
+  }
+  WriteJson $sb ([string]$v)
+}
+$sbJson = New-Object Text.StringBuilder
+WriteJson $sbJson $bundle
+$json = $sbJson.ToString()
 [IO.File]::WriteAllText((Join-Path $OutFolder 'bundle.json'), $json, [Text.UTF8Encoding]::new($false))
+$total = $clock.Elapsed.TotalSeconds
+$other = $total - $phase.step - $phase.sheet_metal - $phase.mass
+$timing = @("Export of $rootFile", ("Total {0:n1} s for {1} documents" -f $total, $docs.Count),
+  ("  STEP export            {0,8:n1} s" -f $phase.step), ("  sheet metal and flats  {0,8:n1} s" -f $phase.sheet_metal),
+  ("  mass and size          {0,8:n1} s" -f $phase.mass), ("  walk, constraints, joints, patterns {0,8:n1} s" -f $other), '', 'Slowest parts:')
+$timing += $partTimes | Sort-Object Seconds -Descending | Select-Object -First 15 | ForEach-Object { "  {0,8:n1} s  {1}" -f $_.Seconds, $_.Name }
+[IO.File]::WriteAllLines((Join-Path $OutFolder 'export-timing.txt'), [string[]]$timing)
+$timing | Select-Object -First 6 | ForEach-Object { Write-Host $_ }
 [IO.File]::WriteAllText((Join-Path $OutFolder 'ready'), (Get-Date).ToString('o'))
 Write-Host "Bundle written: $OutFolder ($($docs.Count) documents, $($warnings.Count) warnings)"
