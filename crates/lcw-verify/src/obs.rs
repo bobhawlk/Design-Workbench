@@ -189,6 +189,17 @@ pub fn name_root(name: &str) -> &str {
     }
 }
 
+/// A built name without the " (N)" a design library adds to tell apart two different designs that
+/// share a name (two part files both called `lever` become `lever` and `lever (2)`), and without
+/// the occurrence number. Which of the same-named parts it is, is then the geometry's to say.
+pub fn design_root(name: &str) -> &str {
+    let r = name_root(name);
+    match r.strip_suffix(')').and_then(|x| x.rsplit_once(" (")) {
+        Some((base, n)) if !base.is_empty() && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => base,
+        _ => r,
+    }
+}
+
 /// A component's links: component id → the design file it links.
 pub fn parse_links(p: &Profile, j: &Json) -> BTreeMap<u64, String> {
     let k = |key: &str| p.vname("links", key);
@@ -266,4 +277,19 @@ pub fn bbox_corners(b: &Bbox) -> [V3; 8] {
         *slot = v3(if i & 1 == 0 { b.min.x } else { b.max.x }, if i & 2 == 0 { b.min.y } else { b.max.y }, if i & 4 == 0 { b.min.z } else { b.max.z });
     }
     c
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn a_design_told_apart_by_a_number_has_the_same_root() {
+        assert_eq!(design_root("lever (2):1"), "lever");
+        assert_eq!(design_root("lever (2)"), "lever");
+        assert_eq!(design_root("lever:3"), "lever");
+        // Inventor's own suffixes are part of the name.
+        assert_eq!(design_root("M4 x 20(2):1"), "M4 x 20(2)");
+        assert_eq!(design_root("plate (left)"), "plate (left)");
+    }
 }

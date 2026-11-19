@@ -11,7 +11,7 @@ use lcw_json::{obj, Json};
 use crate::assign::{assign, FORBIDDEN};
 use crate::expect::{expand, ExpInst, Expected};
 use crate::judge::{frame_delta, judge, rel_diff, transformed_box, Judged, Tol};
-use crate::obs::{measure_design, name_root, parse_links, step_vertices, Geo, Inst, Measured, Tree};
+use crate::obs::{design_root, measure_design, name_root, parse_links, step_vertices, Geo, Inst, Measured, Tree};
 use crate::session::Session;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,8 +113,16 @@ fn box_json(b: &Bbox) -> Json {
     obj! {"min" => b.min.to_array(), "max" => b.max.to_array()}
 }
 
+/// Whether a built instance may be the expected one: the same name (allowing for the " (N)" that
+/// tells apart two different designs of one name: which one it is, the geometry then decides), or
+/// the same volume.
+fn same_name(e: &ExpInst, o: &Inst) -> bool {
+    let names = [name_root(o.name()), o.comp_name.as_str(), design_root(o.name()), design_root(&o.comp_name)];
+    names.iter().any(|n| *n == e.doc_name || *n == name_root(e.name()))
+}
+
 fn compatible(e: &ExpInst, o: &Inst, rg: Option<&Geo>, og: Option<&Geo>, vol_tol: f64) -> bool {
-    if name_root(o.name()) == e.doc_name || o.comp_name == e.doc_name || name_root(o.name()) == name_root(e.name()) {
+    if same_name(e, o) {
         return true;
     }
     match (rg.and_then(|g| g.volume), og.and_then(|g| g.volume)) {
