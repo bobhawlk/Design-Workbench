@@ -26,7 +26,7 @@ USAGE:
   inv2sc run <build-steps.json> [options]   build from a steps file written earlier
   inv2sc limits <folder convert wrote> [--redo] [options]
                 find each joint's travel limits in a built assembly (the stage convert runs
-                after the assembly; after `convert --no-limits`, or to take up a stage that was
+                with `convert --limits`; after a plain `convert`, or to take up a stage that was
                 cut short: joints already in limits-found.jsonl are not searched again, except
                 those not found in time; --redo searches them all). Writes limits-report.md.
   inv2sc probe [--solidcraft-cli PATH] [--connect HOST:PORT] [--profile FILE]
@@ -47,8 +47,13 @@ OPTIONS:
   --merge MODE            identical parts with different files: report | same-name (default) | all
   --no-sheet-metal        bring every part in as a plain solid
   --no-infer              don't infer joints for unconstrained parts (they're held rigid)
-  --no-limits             don't search each joint's travel for its limits (`inv2sc limits`
-                          can do it later)
+  --limits                search each joint's travel for its limits after the assembly is
+                          built (off by default: `inv2sc limits` can do it later; a limit that
+                          is too tight stops a lever, none leaves it free). --no-limits is
+                          accepted and does nothing (it is the default)
+  --inventor-constraints  also create SolidCraft constraints from Inventor constraints whose
+                          geometry lands on the parts (off by default: parts are joined by
+                          their geometry, and Inventor's constraints are evidence only)
   --no-patterns           don't make pattern spacing a parameter
   --max-thickness MM      thickest plate treated as sheet metal (default 6)
   --path-map FROM=TO      write paths for another machine: build steps made here name
@@ -86,6 +91,7 @@ struct Args {
     sheet_metal: bool,
     infer: bool,
     limits: bool,
+    inventor_constraints: bool,
     patterns: bool,
     max_thickness: f64,
     verbose: bool,
@@ -117,7 +123,8 @@ fn parse_args() -> Result<Args, String> {
         merge: Merge::SameName,
         sheet_metal: true,
         infer: true,
-        limits: true,
+        limits: false,
+        inventor_constraints: false,
         patterns: true,
         max_thickness: 6.0,
         verbose: false,
@@ -153,6 +160,8 @@ fn parse_args() -> Result<Args, String> {
             "--no-sheet-metal" => a.sheet_metal = false,
             "--no-infer" => a.infer = false,
             "--no-limits" => a.limits = false,
+            "--limits" => a.limits = true,
+            "--inventor-constraints" => a.inventor_constraints = true,
             "--no-patterns" => a.patterns = false,
             "--max-thickness" => a.max_thickness = value("--max-thickness")?.parse().map_err(|_| "--max-thickness takes a number of mm")?,
             "--verbose" | "-v" => a.verbose = true,
@@ -243,6 +252,7 @@ fn analysis_options(a: &Args) -> Options {
     let mut o = Options { merge: a.merge, ..Options::default() };
     o.sheet.max_thickness = a.max_thickness;
     o.joints.infer = a.infer;
+    o.joints.inventor_constraints = a.inventor_constraints;
     o
 }
 
@@ -629,6 +639,7 @@ fn clone_args(a: &Args) -> Args {
         sheet_metal: a.sheet_metal,
         infer: a.infer,
         limits: a.limits,
+        inventor_constraints: a.inventor_constraints,
         patterns: a.patterns,
         max_thickness: a.max_thickness,
         verbose: a.verbose,

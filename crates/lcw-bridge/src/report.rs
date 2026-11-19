@@ -145,8 +145,8 @@ pub fn markdown(a: &Analysis, runs: &[DesignResult], probe: &[String], events: &
         let ev = &a.joints.evidence;
         let count = |p: &str| ev.iter().filter(|e| e.outcome.starts_with(p)).count();
         s.push_str(&format!(
-            "\n### Inventor constraints used as evidence\n\n{} Inventor constraint(s) and joint(s) were not made into SolidCraft constraints, because their exported geometry is incomplete or does not land on the parts (the reason is listed). They were used as evidence: {} agree with a rigid group, {} with a joint, {} decided what a part with no joint is held to, {} were not used, {} name no part with geometry.\n\n",
-            ev.len(), count("agrees: the parts"), count("agrees: `"), count("used:"), count("not used"), count("names no part")
+            "\n### Inventor constraints used as evidence\n\n{} Inventor constraint(s) and joint(s) were not made into SolidCraft constraints: {} not created by design (their geometry lands on the parts, but the parts are joined by their geometry; `--inventor-constraints` creates them), the rest because their exported geometry is incomplete or does not land on the parts (the reason is listed). They were used as evidence: {} agree with a rigid group, {} with a joint, {} decided what a part with no joint is held to, {} were not used, {} name no part with geometry.\n\n",
+            ev.len(), ev.iter().filter(|e| e.why_not.starts_with("not created (by design")).count(), count("agrees: the parts"), count("agrees: `"), count("used:"), count("not used"), count("names no part")
         ));
         s.push_str("| Constraint | In | Kind | Between | Why not a SolidCraft constraint | Outcome |\n|---|---|---|---|---|---|\n");
         for e in ev {

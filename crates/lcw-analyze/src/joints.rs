@@ -186,6 +186,10 @@ pub struct Options {
     pub evidence_fit: f64,
     /// How far a constraint's picked point may be from the face it names (mm).
     pub pick_tol: f64,
+    /// Create SolidCraft constraints from Inventor constraints whose geometry lands on the parts.
+    /// Off by default: parts are joined by their geometry (pins, fasteners, rigid groups), and
+    /// every Inventor constraint is evidence; created ones over-constrain or lock linkages.
+    pub inventor_constraints: bool,
     /// Name fragments that make a part a fastener (lowercase).
     pub fastener_words: Vec<String>,
     /// Name fragments of parts that turn when pinned to the structure on one axis.
@@ -203,6 +207,7 @@ impl Default for Options {
             evidence_axis_tol: 0.6,
             evidence_fit: 2.0,
             pick_tol: 0.05,
+            inventor_constraints: false,
             fastener_words: [
                 "bolt", "screw", "nut", "washer", "nyloc", "rivet", "standoff", "stand-off", "circlip", "dowel", "bs 4168", "iso 4762", "iso 4032", "iso 7089",
                 "din 912", "din 934", "din 125", "ansi", "asme b18", "as 1421", "metric series", "socket head", "cap screw", "hex head", "m2 x", "m2.5 x", "m3 x",
@@ -225,6 +230,9 @@ impl Default for Options {
         }
     }
 }
+
+/// Why a constraint whose geometry is complete is still evidence only (`inventor_constraints` off).
+pub const NOT_CREATED: &str = "not created (by design; its geometry lands on the parts, but parts are joined by their geometry only, and --inventor-constraints would create it)";
 
 /// Map Inventor's constraint kinds onto SolidCraft's rules.
 pub fn rule_for(kind: &str, a: EntityKind, b: EntityKind) -> Option<&'static str> {
@@ -476,7 +484,11 @@ pub fn plan(model: &Model, instances: &[Inst], features: &[Option<PartFeatures>]
                 // The inference still covers these parts: the constraints hold them as Inventor
                 // did, and the inferred holds and joints agree with them as built, so a group of
                 // constrained parts is never left joined to nothing grounded.
-                Ok(p) => out.constraints.push(p),
+                Ok(p) if opts.inventor_constraints => out.constraints.push(p),
+                Ok(_) => {
+                    ev.why_not = NOT_CREATED.into();
+                    out.evidence.push(ev);
+                }
                 Err(why) => {
                     ev.why_not = why;
                     out.evidence.push(ev);
@@ -1145,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn a_constraint_with_complete_geometry_on_the_parts_is_carried_over() {
+    fn a_constraint_with_complete_geometry_is_evidence_unless_asked_for() {
         let mut c = blind("Mate:1", "mate", "lever:1", "frame:1", EntityKind::Plane);
         c.a.point = v3(10.0, 0.0, 5.0);
         c.a.dir = Some(-V3::Z);
@@ -1154,14 +1166,20 @@ mod tests {
         let (mut m, mut f) = lever_model("lever", vec![c.clone()]);
         // The lever's underside lies on the frame's top.
         f[2].as_mut().unwrap().flats.push(Flat { origin: v3(0.0, 0.0, 5.0), normal: -V3::Z, area: 50.0 });
+        // By default it is evidence only, not created.
         let p = run(&m, &f);
+        assert!(p.constraints.is_empty());
+        assert_eq!(p.evidence[0].why_not, NOT_CREATED);
+        assert_eq!(p.joints.len(), 1, "the lever still turns on its pin");
+        let with = Options { inventor_constraints: true, ..Options::default() };
+        let p = plan(&m, &m.instances(), &f, &with);
         assert_eq!(p.constraints.len(), 1, "{:?}", p.evidence);
         assert_eq!(p.constraints[0].rule, "mate");
         assert!(matches!(p.constraints[0].a.pick, Pick::Face(_)));
         // A plane that misses every face of the part is evidence, with why.
         c.b.point = v3(10.0, 0.0, 7.0);
         m.defs[0].constraints = vec![c];
-        let p = run(&m, &f);
+        let p = plan(&m, &m.instances(), &f, &with);
         assert!(p.constraints.is_empty());
         assert!(p.evidence[0].why_not.contains("no planar face"), "{}", p.evidence[0].why_not);
     }

@@ -338,6 +338,13 @@ pub fn assembly_plan(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fil
         }
     }
     for c in &a.joints.constraints {
+        // As for joints: both sides inside one copy of a repeated sub-assembly resolve to that
+        // copy's own occurrence, which SolidCraft refuses ("needs two different occurrences").
+        let common = c.a.path.iter().zip(&c.b.path).take_while(|(x, y)| x == y).count();
+        if (1..=common).any(|n| placed.copies.contains(&c.a.path[..n])) {
+            notes.push(format!("{}: not made in the repeated sub-assembly's copy (SolidCraft can't constrain two parts inside a copy); the first placement has it", c.name));
+            continue;
+        }
         steps.push(constraint_step(&placed, c));
     }
     // What the analysis found, on the design itself.
