@@ -357,7 +357,9 @@ fn place_children(a: &Analysis, def: usize, prefix: &[usize], parent_var: Option
         path.push(i);
         let vname = format!("occ:{}", key(&path));
         let child = &m.defs[o.def];
-        let parent = parent_var.map(var).unwrap_or(Json::Null);
+        // The root by its id: `occurrence.copy` without a parent puts the copy in the copied
+        // placement's parent, which for a part first placed in a sub-assembly is the wrong one.
+        let parent = parent_var.map(var).unwrap_or(Json::from(0));
         if child.assembly {
             match placed.asm_component.get(&o.def).cloned() {
                 None => {
@@ -443,6 +445,16 @@ fn origin(a: &Analysis, placed: &Placed, path: &[usize], point: V3, z: V3, x: V3
     o
 }
 
+/// The placement of an instance as `occurrence_props` takes it, for a step's guard.
+fn guard_of(placed: &Placed, path: &[usize]) -> Option<Json> {
+    let mut o = obj! {"occurrence" => var(placed.occ.get(path)?)};
+    if placed.repeated.contains(path) {
+        let full: Vec<Json> = (1..=path.len()).filter_map(|i| placed.occ.get(&path[..i]).map(|v| var(v))).collect();
+        o.set("path", Json::Arr(full));
+    }
+    Some(o)
+}
+
 fn joint_step(a: &Analysis, placed: &Placed, j: &JointPlan, _limits_later: bool) -> Step {
     let z = j.z.unit().unwrap_or(V3::Z);
     let x = j.x.and_then(|x| (x - z * x.dot(z)).unit()).unwrap_or_else(|| z.any_perp());
@@ -457,7 +469,8 @@ fn joint_step(a: &Analysis, placed: &Placed, j: &JointPlan, _limits_later: bool)
     if !j.limits.is_empty() {
         p.set("limits", Json::Arr(j.limits.iter().map(|l| Json::from(*l)).collect()));
     }
-    Step::op("joint", p, format!("{} {} ({})", j.kind.name(), j.name, j.basis())).soft().group("joints")
+    let guard: Vec<Json> = [&j.a, &j.b].iter().filter_map(|x| guard_of(placed, x)).collect();
+    Step::op("joint", p, format!("{} {} ({})", j.kind.name(), j.name, j.basis())).soft().group("joints").guard(guard)
 }
 
 fn pick_origin(placed: &Placed, path: &[usize], pick: &Pick) -> Json {
@@ -493,7 +506,8 @@ fn constraint_step(placed: &Placed, c: &ConstraintPlan) -> Step {
     }
     // No fallback to a joint: a joint made from a constraint's rule, at a guessed frame, frees or
     // locks parts the constraint does not. A constraint SolidCraft refuses is reported.
-    let step = Step::op("constraint", p, format!("{} {} (Inventor constraint)", c.rule, c.name)).soft().group("constraints");
+    let guard: Vec<Json> = [&c.a.path, &c.b.path].iter().filter_map(|x| guard_of(placed, x)).collect();
+    let step = Step::op("constraint", p, format!("{} {} (Inventor constraint)", c.rule, c.name)).soft().group("constraints").guard(guard);
     step
 }
 

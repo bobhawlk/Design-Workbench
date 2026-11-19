@@ -23,6 +23,7 @@
     "list_bodies":       {"command": "inspect.measure",            "params": {"names_only": "names_only"}},
     "joint_list":        {"command": "joint.list",                 "params": {"quiet": "quiet"}},
     "drive":             {"command": "joint.drive",                "params": {"joint": "joint", "value": "value", "quiet": "quiet"}},
+    "undo":              {"command": "edit.undo",                  "params": {}},
     "verify_open":       {"tool": "open",                             "params": {"path": "path"}},
     "verify_measure":    {"tool": "measure",                          "params": {"summary": "summary"}},
     "list_components":   {"command": "component.list",             "params": {"compact": "compact", "bodies": "bodies"}},
@@ -63,6 +64,8 @@
     "list": {"dof": "/dof", "dof_value": "dof", "dof_occurrence": "occurrence", "fixed": "/fixed", "conflicts": "/conflicts", "errors": "/errors", "floating": "/floating",
              "chain_occurrences": "occurrences", "chain_joints": "joints", "problem_name": "name", "problem_why": "why",
              "joints": "/joints", "joint_name": "name", "joint_values": "values", "value": "value", "value_limits": "limits", "value_unit": "unit"},
+    "guard": {"about": "A step with a guard (constraints and joints) is undone with the `undo` op when it moves a guarded placement: `occurrence_props` before and after, compared by these pointers within tol_mm.",
+              "points": ["/total/center_of_mass", "/total/bbox/min", "/total/bbox/max"], "tol_mm": 0.01},
     "drive": {"moved": "/moved", "reason": "/reason", "values": "/values", "stopped_by_loop": "/stopped_by_loop", "stopped_by_contact": "/stopped_by_contact", "conflicts": "/conflicts"}
   },
   "fallbacks": {

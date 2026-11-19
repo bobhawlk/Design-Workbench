@@ -472,3 +472,24 @@ fn the_mechanism_check_drives_each_joint_and_reports_what_holds_it() {
     assert_eq!(drives[3].f64_of("value"), Some(-5.0));
     assert_eq!(v.data.get("floating").and_then(Json::as_array).map(<[Json]>::len), Some(1));
 }
+
+// ---- placement is the truth ----
+
+#[test]
+fn a_constraint_that_moves_a_part_is_undone_and_reported() {
+    let at = |x: f64| obj! {"total" => obj!{"center_of_mass" => vec![x, 0.0, 0.0], "bbox" => obj!{"min" => vec![x - 1.0, -1.0, -1.0], "max" => vec![x + 1.0, 1.0, 1.0]}}};
+    let step = |name: &str| {
+        Step::op("constraint", obj! {"type" => "mate", "a" => obj!{"occurrence" => "Lid:1", "face" => vec![0.0, 0.0, 1.0]}, "b" => obj!{"occurrence" => "Box:1", "face" => vec![0.0, 0.0, 1.0]}, "name" => name}, format!("mate {name}"))
+            .soft()
+            .group("constraints")
+            .guard(vec![obj! {"occurrence" => "Lid:1"}])
+    };
+    let design = DesignSteps { name: "Box".into(), file: "/out/Box.sc".into(), steps: vec![step("Stays"), step("Moves")], notes: Vec::new() };
+    // Stays: read twice where it was. Moves: before, after (40 mm off), after the undo.
+    let mut rec = Recorder::new().on("occurrence.properties", Action::Answer(at(0.0)), 3).on("occurrence.properties", Action::Answer(at(40.0)), 1).on("occurrence.properties", Action::Answer(at(0.0)), 1);
+    let profile = Profile::builtin();
+    let r = Runner::new(&mut rec, &profile).run(&design);
+    assert_eq!(r.steps[0].status, Status::Done);
+    assert!(matches!(&r.steps[1].status, Status::Skipped(w) if w.contains("40.000 mm") && w.contains("undone")), "{:?}", r.steps[1].status);
+    assert_eq!(rec.commands().iter().filter(|c| *c == "edit.undo").count(), 1);
+}

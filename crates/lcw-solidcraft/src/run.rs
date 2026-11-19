@@ -310,6 +310,15 @@ impl<'a> Runner<'a> {
         if step.tool == "verify_joints" {
             return self.verify_joints(&args);
         }
+        // Where the guarded placements are before the step.
+        let guard: Vec<Json> = step.guard.iter().map(|g| substitute(g, &|n| self.lookup(n), &mut Vec::new())).collect();
+        let mut before = Vec::new();
+        for g in &guard {
+            match self.placement_of(g) {
+                Ok(p) => before.push(p),
+                Err(o) => return o,
+            }
+        }
         let timeout = self.profile.timeout_for(step.op.as_deref(), &step.tool, self.timeout);
         let mut first = match (known_error, &step.op) {
             (Some(e), _) => Err(CallError::Failed(e)),
@@ -394,8 +403,52 @@ impl<'a> Runner<'a> {
                 }
             }
         };
+        // Placement is the truth: a step that moved a guarded part is undone.
+        for (g, b) in guard.iter().zip(&before) {
+            let after = match self.placement_of(g) {
+                Ok(p) => p,
+                Err(o) => return o,
+            };
+            let moved = b.iter().zip(&after).map(|(x, y)| (0..3).map(|i| (x[i] - y[i]).powi(2)).sum::<f64>().sqrt()).fold(0.0, f64::max);
+            let tol = self.profile.mechanism.get("guard").and_then(|x| x.f64_of("tol_mm")).unwrap_or(0.01);
+            if b.len() != after.len() || moved > tol {
+                let who = g.get("occurrence").map(Json::to_compact).unwrap_or_default();
+                let t = self.profile.timeout_for(Some("undo"), "execute", self.timeout);
+                let undone = match self.execute_op("undo", &Json::obj(), t) {
+                    Ok(_) => match self.placement_of(g) {
+                        Ok(p) => p.iter().zip(b).all(|(x, y)| (0..3).all(|i| (x[i] - y[i]).abs() <= tol)),
+                        Err(o) => return o,
+                    },
+                    Err(e) if e.ends_session() => return Outcome::lost(&e, &format!("undoing {}", step.label)),
+                    Err(_) => false,
+                };
+                let why = format!("it moved occurrence {who} {moved:.3} mm from where Inventor has it");
+                return Outcome::of(if undone { Status::Skipped(format!("{why}, so it was undone")) } else { Status::Failed(format!("{why}, and undoing it did not put it back")) });
+            }
+        }
         self.bind(step, &result);
         Outcome { status, note, data: Json::Null, lost: None }
+    }
+
+    /// A placement's position, as the points the profile's `mechanism.guard` names (centre of
+    /// mass, box corners) read from `occurrence_props`.
+    fn placement_of(&mut self, g: &Json) -> Result<Vec<[f64; 3]>, Outcome> {
+        let t = self.profile.timeout_for(Some("occurrence_props"), "execute", self.timeout);
+        let r = match self.execute_op("occurrence_props", g, t) {
+            Ok(r) => r,
+            Err(e) if e.ends_session() => return Err(Outcome::lost(&e, "reading a placement")),
+            Err(e) => return Err(Outcome::of(Status::Skipped(format!("not run: its parts' placement could not be read to check it ({})", e.message())))),
+        };
+        let guard = self.profile.mechanism.get("guard").cloned().unwrap_or_default();
+        Ok(guard
+            .arr_of("points")
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter_map(|p| {
+                let a = r.pointer(p)?.as_array()?;
+                (a.len() == 3).then(|| [a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0), a[2].as_f64().unwrap_or(0.0)])
+            })
+            .collect())
     }
 
     fn bind(&mut self, step: &Step, result: &Json) {
@@ -626,6 +679,9 @@ impl<'a> Runner<'a> {
                 break;
             }
             let Some(op) = step.op.as_deref() else { break };
+            if !step.guard.is_empty() {
+                break;
+            }
             if step.tool != "execute" || self.profile.resolve(op) != Some(op) {
                 break;
             }
