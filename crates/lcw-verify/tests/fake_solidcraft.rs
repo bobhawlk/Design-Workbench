@@ -374,7 +374,7 @@ fn a_bundle_without_inventor_volumes_falls_back_to_the_step_and_says_so() {
     });
     let c1 = r.check(1).unwrap();
     assert_eq!(c1.status, Status::Pass, "{:?}", c1.details);
-    assert!(c1.summary.contains("no Inventor volume or box for any part"), "{}", c1.summary);
+    assert!(c1.summary.contains("no mass in the bundle"), "{}", c1.summary);
     assert!(r.limits.iter().any(|l| l.contains("0 of 3 parts")), "{:?}", r.limits);
 }
 

@@ -455,7 +455,7 @@ fn check_parts(bundle: &Bundle, part_docs: &[&Document], parts: &BTreeMap<String
         total - skipped,
         tol.volume_rel * 100.0,
         tol.bbox_mm,
-        if with_bundle > 0 { format!("; {with_bundle} also against Inventor's volume within {:.1}%", tol.bundle_volume_rel * 100.0) } else { "; the bundle has no Inventor volume or box for any part, so nothing was compared against Inventor's own numbers".to_string() },
+        if with_bundle > 0 { format!("; {with_bundle} also against Inventor's volume within {:.1}%", tol.bundle_volume_rel * 100.0) } else { "; no mass in the bundle (no Inventor volume or box for any part), so nothing was compared against Inventor's own numbers".to_string() },
         factor_note.as_ref().map(|_| ", and a systematic factor").unwrap_or_default()
     );
     let _ = bundle;
