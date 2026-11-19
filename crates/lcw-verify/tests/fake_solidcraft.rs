@@ -52,6 +52,8 @@ struct Builder {
     next: u64,
     by_part: BTreeMap<String, u64>,
     scale: f64,
+    /// A part's own scale on top of `scale` (its built design differs from its STEP).
+    per_part: BTreeMap<String, f64>,
 }
 
 impl Builder {
@@ -61,7 +63,8 @@ impl Builder {
         }
         let id = self.next;
         self.next += 1;
-        let b = block.map(|(a, b, c)| (a * self.scale, b * self.scale, c * self.scale));
+        let k = self.scale * self.per_part.get(name).copied().unwrap_or(1.0);
+        let b = block.map(|(a, b, c)| (a * k, b * k, c * k));
         self.d.comps.push((id, name.to_string(), vec![], b));
         self.by_part.insert(name.to_string(), id);
         id
@@ -94,7 +97,11 @@ impl Builder {
 }
 
 fn build_design(name: &str, nodes: &[Node], scale: f64) -> Design {
-    let mut b = Builder { d: Design { name: name.into(), ..Design::default() }, next: 1, by_part: BTreeMap::new(), scale };
+    build_scaled(name, nodes, scale, &BTreeMap::new())
+}
+
+fn build_scaled(name: &str, nodes: &[Node], scale: f64, per_part: &BTreeMap<String, f64>) -> Design {
+    let mut b = Builder { d: Design { name: name.into(), ..Design::default() }, next: 1, by_part: BTreeMap::new(), scale, per_part: per_part.clone() };
     b.d.comps.push((0, name.to_string(), vec![], None));
     b.add(0, nodes);
     b.d
@@ -288,7 +295,9 @@ fn verify(name: &str, nodes: &[Node], scale: BTreeMap<String, f64>, clash: Json,
     edit(&mut b);
     b.write(&dir).unwrap();
     let b = Bundle::read(&dir).unwrap();
-    let mut fake = Fake::new(build_design("asm", nodes, 1.0), clash);
+    // The assembly places the built part designs, so a part design that differs from its STEP
+    // differs in the assembly too.
+    let mut fake = Fake::new(build_scaled("asm", nodes, 1.0, &scale), clash);
     fake.part_scale = scale;
     let profile = Profile::builtin();
     let mut s = Session::new(&mut fake, &profile, Duration::from_secs(60));
@@ -351,6 +360,34 @@ fn a_part_design_with_the_wrong_volume_is_named() {
     let text = c1.details.join("\n");
     assert!(text.contains("Pin: volume") && text.contains("against Inventor's"), "{text}");
     assert!(!text.contains("Plate:"), "only the Pin is wrong: {text}");
+}
+
+#[test]
+fn a_part_whose_design_differs_from_its_step_is_placed_right_and_named_by_the_part_check() {
+    // The block's built design is 1% larger than its STEP (as a part rebuilt as sheet metal can
+    // be), about its own origin: its centre of mass is 0.19 mm from where the STEP puts it, but
+    // it is placed exactly where Inventor has it.
+    let mut scale = BTreeMap::new();
+    scale.insert("Block".to_string(), 1.01);
+    let r = verify("design-differs", &good_nodes(), scale, no_clash(), |_| {});
+    let c2 = r.check(2).unwrap();
+    assert_eq!(c2.data.f64_of("misplaced"), Some(0.0), "{:?}", c2.details);
+    assert_eq!(c2.status, Status::Pass, "{:?}", c2.details);
+    assert!(c2.summary.contains("1 placed right whose geometry differs from its STEP"), "{}", c2.summary);
+    let c1 = r.check(1).unwrap();
+    assert_eq!(c1.status, Status::Fail);
+    let text = c1.details.join("\n");
+    assert!(text.contains("Block: volume") && text.contains("Block: centre of mass"), "{text}");
+
+    // A part that really is off still is, whatever its geometry.
+    let mut nodes = good_nodes();
+    nodes[1] = Node::Part("Block:1", "Block", M4::rotation(v3(100.0, 0.0, 0.0), V3::Z, 90f64.to_radians()) * t(0.5, 0.0, 0.0));
+    let mut scale = BTreeMap::new();
+    scale.insert("Block".to_string(), 1.01);
+    let r = verify("design-differs-moved", &nodes, scale, no_clash(), |_| {});
+    let c2 = r.check(2).unwrap();
+    assert_eq!(c2.data.f64_of("misplaced"), Some(1.0), "{:?}", c2.details);
+    assert!(c2.details.join("\n").contains("MISPLACED Block:1"), "{:?}", c2.details);
 }
 
 #[test]

@@ -69,6 +69,14 @@ pub struct Judged {
     /// part onto itself, a part merged into an identical one that has another frame).
     pub equivalent: bool,
     pub reason: String,
+    /// What the built instance was compared with: "built design" (the part's saved design, as
+    /// SolidCraft measures it) or "STEP" (SolidCraft's import of the bundle's STEP).
+    pub reference: &'static str,
+    /// Against the built design: the centre of mass's distance from where the STEP puts it.
+    pub step_com_mm: Option<f64>,
+    /// Placed right, but the part's geometry differs from its STEP (said here, judged by the
+    /// part check).
+    pub geometry_note: String,
 }
 
 pub fn rel_diff(a: f64, b: f64) -> f64 {

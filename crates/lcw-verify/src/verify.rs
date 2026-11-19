@@ -232,21 +232,6 @@ pub fn run(s: &mut Session, inp: &Inputs) -> Result<Report, String> {
         }
     }
     let pairs = assign(&cost);
-    let mut judged: Vec<(usize, usize, Judged)> = Vec::new();
-    for (i, k) in pairs.iter().enumerate() {
-        if let Some(k) = k {
-            let (e, o) = (exp_leaves[i], obs_leaves[*k]);
-            let j = match (ref_geo(&e.doc), o.geo.as_ref()) {
-                (Some(rg), Some(og)) => judge(rg, &parts[&e.doc].verts, &e.world, og, &o.inst.world, tol),
-                _ => {
-                    let (mm, deg) = frame_delta(&e.world, &o.inst.world);
-                    let frame_ok = mm <= tol.pos_mm && deg <= tol.angle_deg;
-                    Judged { frame_mm: mm, frame_deg: deg, frame_ok, ok: frame_ok, method: "frame", reason: "no measurement to compare the geometry by".into(), ..Judged::default() }
-                }
-            };
-            judged.push((i, *k, j));
-        }
-    }
     let matched_obs: std::collections::BTreeSet<usize> = pairs.iter().flatten().copied().collect();
     // Sub-assemblies: matched by name and frame.
     let exp_asm: Vec<&ExpInst> = expected.insts.iter().filter(|e| e.is_assembly).collect();
@@ -290,6 +275,51 @@ pub fn run(s: &mut Session, inp: &Inputs) -> Result<Report, String> {
         if let Some(p) = parts.get_mut(doc) {
             p.built_file = Some(f.clone());
             p.built = measured_files.get(f).cloned();
+        }
+    }
+
+    // Placement is judged against the part's own built design placed by the bundle's matrix:
+    // where a converted part's geometry differs a little from its STEP (sheet metal rebuilt from
+    // the solid), its centre of mass moves with it, and that is the part check's to report, not a
+    // misplacement. The STEP is the reference where the design could not be measured.
+    let ref_geo = |doc: &str| parts.get(doc).and_then(|p| p.reference.geo.as_ref());
+    let mut judged: Vec<(usize, usize, Judged)> = Vec::new();
+    for (i, k) in pairs.iter().enumerate() {
+        if let Some(k) = k {
+            let (e, o) = (exp_leaves[i], obs_leaves[*k]);
+            let pd = &parts[&e.doc];
+            let design = pd.built.as_ref().filter(|m| m.error.is_none()).and_then(|m| m.geo.as_ref()).filter(|g| g.com.is_some() || g.bbox.is_some());
+            let j = match (design.or(ref_geo(&e.doc)), o.geo.as_ref()) {
+                (Some(rg), Some(og)) => {
+                    // The STEP's vertices bound the box from below only while the design's box is the STEP's.
+                    let same_box = match (design.and_then(|d| d.bbox), pd.reference.geo.as_ref().and_then(|g| g.bbox)) {
+                        (Some(db), Some(sb)) => (db.min - sb.min).norm().max((db.max - sb.max).norm()) <= tol.bbox_mm,
+                        (None, _) => true,
+                        _ => false,
+                    };
+                    let verts: &[V3] = if same_box { &pd.verts } else { &[] };
+                    let mut j = judge(rg, verts, &e.world, og, &o.inst.world, tol);
+                    if design.is_some() {
+                        j.reference = "built design";
+                        if let Some(sg) = ref_geo(&e.doc) {
+                            let js = judge(sg, &pd.verts, &e.world, og, &o.inst.world, tol);
+                            j.step_com_mm = js.com_mm;
+                            if j.ok && !js.ok {
+                                j.geometry_note = format!("its geometry differs from its STEP ({}); see the part check", js.reason);
+                            }
+                        }
+                    } else {
+                        j.reference = "STEP";
+                    }
+                    j
+                }
+                _ => {
+                    let (mm, deg) = frame_delta(&e.world, &o.inst.world);
+                    let frame_ok = mm <= tol.pos_mm && deg <= tol.angle_deg;
+                    Judged { frame_mm: mm, frame_deg: deg, frame_ok, ok: frame_ok, method: "frame", reason: "no measurement to compare the geometry by".into(), ..Judged::default() }
+                }
+            };
+            judged.push((i, *k, j));
         }
     }
 
@@ -380,6 +410,15 @@ fn check_parts(bundle: &Bundle, part_docs: &[&Document], parts: &BTreeMap<String
                         let ds = (bb.size() - rb.size()).norm();
                         if dmax > tol.bbox_mm.max(1e-5 * rb.diagonal()) {
                             problems.push(format!("box corners {} mm from the STEP's (size differs by {} mm)", fmt(dmax), fmt(ds)));
+                        }
+                    }
+                    // Where its mass is: a converted part that differs from its STEP moves it.
+                    if let (Some(bc), Some(rc)) = (bg.com, rg.com) {
+                        let d = bc.dist(rc);
+                        row.set("com_offset_mm", d);
+                        let diag = rg.bbox.map_or(0.0, |b| b.diagonal());
+                        if d > tol.pos_mm.max(tol.pos_rel * diag) {
+                            problems.push(format!("centre of mass {} mm from the STEP's (the placement check compares placed parts with this design, so this is not counted as a misplacement)", fmt(d)));
                         }
                     }
                     // Against what Inventor reported.
@@ -497,6 +536,7 @@ fn check_placements(
     let mut worst_pos: f64 = 0.0;
     let mut by_kind: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut unmeasured = 0usize;
+    let mut geometry_differs = 0usize;
     for (i, k, j) in judged {
         let (e, o) = (exp_leaves[*i], obs_leaves[*k]);
         if o.geo.is_none() {
@@ -507,7 +547,15 @@ fn check_placements(
             "expected" => pathname(&e.names), "built" => pathname(&o.inst.names), "part" => e.doc_name.as_str(),
             "frame_mm" => j.frame_mm, "frame_deg" => j.frame_deg, "method" => j.method,
             "com_mm" => j.com_mm, "inertia_rel" => j.inertia_rel, "volume_rel" => j.volume_rel, "bbox_excess_mm" => j.bbox_excess_mm,
+            "reference" => j.reference,
         };
+        if let Some(d) = j.step_com_mm {
+            row.set("com_mm_vs_step", d);
+        }
+        if !j.geometry_note.is_empty() {
+            geometry_differs += 1;
+            row.set("geometry_note", j.geometry_note.as_str());
+        }
         if j.ok {
             ok += 1;
             if j.equivalent {
@@ -599,14 +647,14 @@ fn check_placements(
         extra.len(),
         exp_asm.len() - asm_missing,
         exp_asm.len(),
-        if unmeasured > 0 { format!("; {unmeasured} could not be measured") } else { String::new() }
-    );
+        if unmeasured > 0 { format!("; {unmeasured} could not be measured") } else { String::new() },
+    ) + &if geometry_differs > 0 { format!("; {geometry_differs} placed right whose geometry differs from its STEP (see the part check)") } else { String::new() };
     let _ = (expected, kinds.len());
     let mut data = obj! {
         "expected_parts" => n_exp, "present" => exactly_once, "ok" => ok, "equivalent_frame" => equivalent, "misplaced" => wrong,
         "missing" => missing.clone(), "extra" => extra.clone(), "unmeasured" => unmeasured,
         "assemblies_expected" => exp_asm.len(), "assemblies_missing" => asm_missing, "assemblies_frame_differs" => asm_off,
-        "wrong_parent" => wrong_parent,
+        "wrong_parent" => wrong_parent, "geometry_differs_from_step" => geometry_differs,
         "tolerance_mm" => tol.pos_mm, "tolerance_rel" => tol.pos_rel, "tolerance_deg" => tol.angle_deg, "tolerance_inertia_rel" => tol.inertia_rel,
     };
     data.set("placements", Json::Arr(rows));
