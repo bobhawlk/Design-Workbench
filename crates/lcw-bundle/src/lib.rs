@@ -515,7 +515,9 @@ fn doc_from(j: &Json) -> Result<Document, BundleError> {
     };
     let mass_j = j.get("mass").cloned().unwrap_or_default();
     let mass = Mass {
-        volume_mm3: mass_j.f64_of("volume_mm3"),
+        // The STEP holds the visible solid bodies only, so when the exporter says what those add up
+        // to, that is the volume to compare against; Inventor's own figure counts hidden bodies too.
+        volume_mm3: mass_j.f64_of("visible_volume_mm3").or(mass_j.f64_of("volume_mm3")),
         area_mm2: mass_j.f64_of("area_mm2"),
         bbox_min: v(&mass_j, "bbox_min"),
         bbox_max: v(&mass_j, "bbox_max"),

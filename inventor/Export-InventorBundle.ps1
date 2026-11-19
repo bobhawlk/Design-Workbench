@@ -252,6 +252,19 @@ function AddGeometry($doc, $d, $id) {
       $mp = $doc.ComponentDefinition.MassProperties
       $box = $doc.ComponentDefinition.RangeBox
       $d.mass = [ordered]@{ volume_mm3 = [double]$mp.Volume * 1000; area_mm2 = [double]$mp.Area * 100; bbox_min = P3 $box.MinPoint; bbox_max = P3 $box.MaxPoint }
+      # A part can hold several solid bodies, some hidden. The STEP has the visible ones only, so
+      # record what those add up to, and how many are hidden.
+      if ($d.kind -eq 'part') {
+        try {
+          $vis = 0.0; $nb = 0; $hid = 0
+          foreach ($body in $doc.ComponentDefinition.SurfaceBodies) {
+            $nb++
+            if ($body.Visible) { try { $vis += [double]$body.Volume(0.001) * 1000 } catch { $vis = [double]::NaN } } else { $hid++ }
+          }
+          $d.mass.bodies = $nb; $d.mass.hidden_bodies = $hid
+          if ($nb -gt 0 -and -not [double]::IsNaN($vis)) { $d.mass.visible_volume_mm3 = $vis }
+        } catch { }
+      }
     }
   } catch { }
   if ($d.kind -ne 'part') { return }
