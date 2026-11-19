@@ -28,11 +28,57 @@ pub struct Options {
     pub assembly_name: Option<String>,
     /// Check the mechanism in SolidCraft once the assembly is saved (`verify_joints`).
     pub verify: bool,
+    /// Limits search: the furthest a point of the moving parts may go between two samples (mm),
+    /// and no further than the thinnest sheet involved. A part can pass through another between
+    /// two samples only when the two together are thinner along the way than this.
+    pub limit_arc_mm: f64,
+    /// The same for the pairs already touching where the search starts (checked in a sweep of
+    /// their own: they stop it only by passing deeper into each other, which starts at the
+    /// touch, so a coarser step can't jump over it).
+    pub limit_rest_arc_mm: f64,
+    /// The sample step of a revolute, in degrees, kept between these.
+    pub limit_min_step_deg: f64,
+    pub limit_max_step_deg: f64,
+    /// The same for the touching pairs' sweep.
+    pub limit_max_rest_step_deg: f64,
+    /// How finely a contact is bisected (mm of travel of the moving parts).
+    pub limit_refine_mm: f64,
+    /// Time each way of each joint's search may take (s); past it that way is "not found".
+    pub limit_budget_s: f64,
+    /// Room round the swept region for a part to count as one it can meet (mm).
+    pub limit_pad_mm: f64,
+    /// A part on the pivot: a round face within this of the joint's axis (mm) and all of it
+    /// within `factor` × that radius + `mm` of the axis.
+    pub limit_axis_tol_mm: f64,
+    pub limit_fastener_factor: f64,
+    pub limit_fastener_mm: f64,
+    /// The most parts one search checks against (the nearest); SolidCraft sweeps at most 256 bodies.
+    pub limit_max_against: usize,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { out_dir: ".".into(), sep: std::path::MAIN_SEPARATOR, sheet_metal: true, find_limits: true, parametric_patterns: true, assembly_name: None, verify: true }
+        Options {
+            out_dir: ".".into(),
+            sep: std::path::MAIN_SEPARATOR,
+            sheet_metal: true,
+            find_limits: true,
+            parametric_patterns: true,
+            assembly_name: None,
+            verify: true,
+            limit_arc_mm: 1.0,
+            limit_rest_arc_mm: 2.0,
+            limit_min_step_deg: 0.05,
+            limit_max_step_deg: 2.0,
+            limit_max_rest_step_deg: 10.0,
+            limit_refine_mm: 0.02,
+            limit_budget_s: 30.0,
+            limit_pad_mm: 2.0,
+            limit_axis_tol_mm: 0.2,
+            limit_fastener_factor: 1.5,
+            limit_fastener_mm: 2.0,
+            limit_max_against: 80,
+        }
     }
 }
 
@@ -40,6 +86,10 @@ impl Default for Options {
 pub struct BuildPlan {
     pub parts: Vec<DesignSteps>,
     pub assembly: DesignSteps,
+    /// The travel limits stage, run after the assembly with its ids (`run_limits`), or later by
+    /// `inv2sc limits`.
+    pub limits: Option<DesignSteps>,
+    pub run_limits: bool,
     /// For each part design: the definition it builds.
     pub part_defs: Vec<usize>,
 }
@@ -47,11 +97,18 @@ pub struct BuildPlan {
 impl BuildPlan {
     pub fn to_json(&self) -> Json {
         let design = |d: &DesignSteps| obj! {"name" => &d.name, "file" => &d.file, "steps" => Json::Arr(d.steps.iter().map(Step::to_json).collect())};
-        obj! {
+        let mut j = obj! {
             "schema" => "lcw-build-steps/1",
             "parts" => Json::Arr(self.parts.iter().map(design).collect()),
             "assembly" => design(&self.assembly),
+        };
+        if let Some(l) = &self.limits {
+            let mut d = design(l);
+            d.set("continues", true);
+            j.set("limits", d);
+            j.set("run_limits", self.run_limits);
         }
+        j
     }
 }
 
@@ -136,7 +193,7 @@ pub fn part_steps(a: &Analysis, def: usize, step_path: &str, out_file: &str, opt
     }
     steps.push(Step::op("component_metadata", cm, "part material and properties").soft().needs("part_component").group("properties"));
     steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {}", d.name)).group("save"));
-    DesignSteps { name: d.name.clone(), file: out_file.to_string(), steps, notes: Vec::new() }
+    DesignSteps { name: d.name.clone(), file: out_file.to_string(), steps, notes: Vec::new(), continues: false }
 }
 
 fn sheet_steps(sp: &SheetPlan, name: &str) -> Vec<Step> {
@@ -176,6 +233,13 @@ fn key(path: &[usize]) -> String {
 
 /// The assembly's steps. `part_files[def]` is the .sc each part design was saved as.
 pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_file: &str, opts: &Options) -> DesignSteps {
+    assembly_plan(a, part_files, out_file, opts).0
+}
+
+/// The assembly's steps and its limits stage (when it has a joint whose travel can be searched:
+/// it is run after the assembly unless `find_limits` is off, and it can be run later with
+/// `inv2sc limits`).
+pub fn assembly_plan(a: &Analysis, part_files: &BTreeMap<usize, String>, out_file: &str, opts: &Options) -> (DesignSteps, Option<DesignSteps>) {
     let m = &a.model;
     let root = &m.defs[m.root];
     let name = opts.assembly_name.clone().unwrap_or_else(|| root.name.clone());
@@ -253,6 +317,7 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
     let boxes = world_boxes(a);
     let mut notes = Vec::new();
     let mut made: Vec<Json> = Vec::new();
+    let mut searches: Vec<Step> = Vec::new();
     for j in &a.joints.joints {
         // Both parts inside one copy of a repeated sub-assembly: SolidCraft anchors both sides on
         // that copy, so the joint can't be made there (the first placement's joint is).
@@ -268,30 +333,8 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
         jj.name = name.clone();
         steps.push(joint_step(a, &placed, &jj, opts.find_limits));
         made.push(obj! {"name" => name.as_str(), "type" => j.kind.name(), "basis" => j.basis()});
-        if opts.find_limits && j.limits.is_empty() && matches!(j.kind, Kind::Revolute | Kind::Slider) {
-            // Check the moving part only against the parts near it: a contact sweep of the whole
-            // assembly is more bodies than SolidCraft sweeps at once.
-            let mut args = obj! {"joint" => name.as_str()};
-            let occ_of = |path: &[usize]| (1..=path.len()).rev().find_map(|i| placed.occ.get(&path[..i]).map(|v| var(v)));
-            if let (Some(mover), Some(bb)) = (occ_of(&j.b), boxes.get(&j.b)) {
-                let near: Vec<Json> = boxes
-                    .iter()
-                    .filter(|(p, b)| **p != j.b && overlaps(bb, b, 2.0))
-                    .filter_map(|(p, _)| occ_of(p))
-                    .filter(|o| *o != mover)
-                    .fold(Vec::new(), |mut v, o| {
-                        if !v.contains(&o) {
-                            v.push(o);
-                        }
-                        v
-                    });
-                if !near.is_empty() && near.len() < 60 {
-                    args.set("occurrences", Json::Arr(vec![mover]));
-                    args.set("against", Json::Arr(near));
-                }
-            }
-            steps.push(Step::op("find_limits", args, format!("find how far {name} can move")).soft().bind(format!("limits:{name}"), &["/values/0"]).group("limits"));
-            steps.push(Step::tool("auto_limits", obj! {"joint" => name.as_str(), "found" => var(&format!("limits:{name}"))}, format!("limit {name}")).soft().needs(format!("limits:{name}")).group("limits"));
+        if j.limits.is_empty() && matches!(j.kind, Kind::Revolute | Kind::Slider) {
+            searches.push(limit_search(a, &placed, &boxes, &groups, j, &name, opts));
         }
     }
     for c in &a.joints.constraints {
@@ -309,11 +352,171 @@ pub fn assembly_steps(a: &Analysis, part_files: &BTreeMap<usize, String>, out_fi
     }
     steps.push(Step::op("doc_metadata", obj! {"values" => obj!{"io.github.lcw.bridge" => obj!{"properties" => props}}}, "assembly properties").soft().group("properties"));
     steps.push(Step::tool("save", obj! {"path" => out_file}, format!("save {name}")).group("save"));
-    if opts.verify {
+    // Travel limits are their own stage, after the assembly is saved: the assembly opened again,
+    // each joint's search, a save after each limit set (so a stage that is stopped keeps what it
+    // found, and `inv2sc limits` takes it up from there), then the mechanism check.
+    let verify = Step::tool("verify_joints", obj! {"joints" => Json::Arr(made)}, "check the mechanism: degrees of freedom, conflicts, and drive each joint").soft().group("verification");
+    let limits = (!searches.is_empty()).then(|| {
+        let mut ls = vec![Step::tool("open", obj! {"path" => out_file}, format!("open {name}")).group("open")];
+        let record = format!("{}{}{}", opts.out_dir.trim_end_matches(['/', '\\']), opts.sep, LIMITS_RECORD);
+        for mut st in searches {
+            st.args.set("record", record.as_str());
+            st.args.set("save", out_file);
+            ls.push(st);
+        }
+        ls.push(Step::tool("save", obj! {"path" => out_file}, format!("save {name}")).group("save"));
+        if opts.verify {
+            ls.push(verify.clone());
+        }
+        DesignSteps { name: format!("{name} limits"), file: out_file.to_string(), steps: ls, notes: Vec::new(), continues: true }
+    });
+    if opts.verify && !(opts.find_limits && limits.is_some()) {
         // After the save, so the drives it tries can't change the saved design.
-        steps.push(Step::tool("verify_joints", obj! {"joints" => Json::Arr(made)}, "check the mechanism: degrees of freedom, conflicts, and drive each joint").soft().group("verification"));
+        steps.push(verify);
     }
-    DesignSteps { name, file: out_file.to_string(), steps, notes }
+    (DesignSteps { name, file: out_file.to_string(), steps, notes, continues: false }, limits)
+}
+
+/// The file (in the output folder) the limits stage records each joint's result in, as it goes.
+pub const LIMITS_RECORD: &str = "limits-found.jsonl";
+
+/// One joint's travel search (`joint_limits`, a runner step): the moving part and what moves with
+/// it (its rigid group) checked against every part that can meet them anywhere on their way
+/// round (or along), sampled finely enough that nothing passes through a part between two samples.
+fn limit_search(a: &Analysis, placed: &Placed, boxes: &BTreeMap<Vec<usize>, Bbox>, groups: &[RigidGroup], j: &JointPlan, name: &str, opts: &Options) -> Step {
+    let ground: BTreeSet<&Vec<usize>> = a.joints.ground.iter().collect();
+    let mut moving: Vec<Vec<usize>> = vec![j.b.clone()];
+    for g in groups {
+        if g.members.contains(&j.b) && !g.members.first().is_some_and(|f| ground.contains(f)) {
+            for m in &g.members {
+                if !moving.contains(m) && !ground.contains(m) {
+                    moving.push(m.clone());
+                }
+            }
+        }
+    }
+    let occ_of = |path: &[usize]| (1..=path.len()).rev().find_map(|i| placed.occ.get(&path[..i]).cloned());
+    let z = j.z.unit().unwrap_or(V3::Z);
+    let revolute = j.kind == Kind::Revolute;
+    let corners = |b: &Bbox| -> Vec<V3> { (0..8).map(|c| V3 { x: if c & 1 == 0 { b.min.x } else { b.max.x }, y: if c & 2 == 0 { b.min.y } else { b.max.y }, z: if c & 4 == 0 { b.min.z } else { b.max.z } }).collect() };
+    let radial = |p: V3| { let d = p - j.origin; (d - z * d.dot(z)).norm() };
+    let axial = |p: V3| (p - j.origin).dot(z);
+    // Where the moving parts are: their farthest reach from the axis and their extent along it.
+    let mut reach: f64 = 0.0;
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut moving_box = Bbox::empty();
+    for m in &moving {
+        if let Some(b) = boxes.get(m) {
+            for c in corners(b) {
+                reach = reach.max(radial(c));
+                lo = lo.min(axial(c));
+                hi = hi.max(axial(c));
+                moving_box.add(c);
+            }
+        }
+    }
+    let pad = opts.limit_pad_mm;
+    // A part is a candidate when its box can meet the region the moving parts sweep: for a
+    // revolute, the cylinder of radius `reach` round the axis between `lo` and `hi`; for a
+    // slider, their box stretched along the axis by `range` each way.
+    let range = if revolute { 360.0 } else { moving_box.diagonal().max(1.0) + boxes.values().fold(Bbox::empty(), |mut u, b| { u.add(b.min); u.add(b.max); u }).diagonal() };
+    let meets = |b: &Bbox| -> bool {
+        let cs = corners(b);
+        let (blo, bhi) = cs.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), c| (l.min(axial(*c)), h.max(axial(*c))));
+        if revolute {
+            let centre = b.center();
+            let half = b.size().norm() / 2.0;
+            blo <= hi + pad && bhi >= lo - pad && radial(centre) - half <= reach + pad
+        } else {
+            let (mut sw, d) = (moving_box, z * range);
+            for c in corners(&moving_box) {
+                sw.add(c + d);
+                sw.add(c - d);
+            }
+            overlaps(&sw, b, pad)
+        }
+    };
+    // A fastener or bushing on the pivot itself (a bolt, nut, washer or spacer round the joint's
+    // axis, all of it close to the axis) turns in place against the moving part: it can't stop
+    // it, and testing how far it passes into the part at every sample is most of the work. The
+    // same goes for one on an axis of a moving part (a nut on a bolt that moves with the lever):
+    // it is that part's fastener and goes with it, wherever the analysis put it.
+    let world_rounds = |path: &Vec<usize>| -> Vec<lcw_analyze::features::Round> {
+        let Some(inst) = a.instances.iter().find(|x| &x.path == path) else { return Vec::new() };
+        let Some(Some(f)) = a.features.get(inst.def) else { return Vec::new() };
+        f.rounds.iter().map(|r| r.transformed(&inst.world)).collect()
+    };
+    let mut axes: Vec<lcw_geom::Axis> = Vec::new();
+    if revolute {
+        axes.extend(lcw_geom::Axis::new(j.origin, z));
+    }
+    for m in &moving {
+        axes.extend(world_rounds(m).into_iter().map(|r| r.axis));
+    }
+    let on_axis = |path: &Vec<usize>| -> bool {
+        let Some(inst) = a.instances.iter().find(|x| &x.path == path) else { return false };
+        let Some(Some(f)) = a.features.get(inst.def) else { return false };
+        let rounds = world_rounds(path);
+        axes.iter().any(|ax| {
+            let r = rounds.iter().filter(|r| r.axis.dir.parallel(ax.dir) && ax.distance_to(r.axis.origin) <= opts.limit_axis_tol_mm).map(|r| r.radius).fold(0.0, f64::max);
+            r > 0.0 && f.vertices.iter().all(|v| ax.distance_to(inst.world.point(*v)) <= opts.limit_fastener_factor * r + opts.limit_fastener_mm)
+        })
+    };
+    let mut candidates: Vec<(f64, Vec<usize>)> = Vec::new();
+    let mut on_pivot = 0usize;
+    for (p, b) in boxes {
+        if moving.iter().any(|m| p.starts_with(m)) || !meets(b) {
+            continue;
+        }
+        if on_axis(p) {
+            on_pivot += 1;
+            continue;
+        }
+        let gap = (b.center() - moving_box.center()).norm();
+        candidates.push((gap, p.clone()));
+    }
+    candidates.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut against: Vec<String> = Vec::new();
+    let mut capped = 0usize;
+    for (_, p) in &candidates {
+        let Some(v) = occ_of(p) else { continue };
+        if against.contains(&v) || moving.iter().any(|m| occ_of(m).as_ref() == Some(&v)) {
+            continue;
+        }
+        if against.len() >= opts.limit_max_against {
+            capped += 1;
+            continue;
+        }
+        against.push(v);
+    }
+    let mut movers: Vec<String> = Vec::new();
+    for m in &moving {
+        if let Some(v) = occ_of(m) {
+            if !movers.contains(&v) {
+                movers.push(v);
+            }
+        }
+    }
+    // Samples close enough that no point of the moving parts goes further than `arc` between
+    // two (and no further than a quarter of the thinnest sheet involved).
+    let thinnest = moving.iter().chain(candidates.iter().map(|(_, p)| p)).filter_map(|p| a.instances.iter().find(|x| &x.path == p)).filter_map(|x| a.sheets.get(&x.def)).map(|s| s.thickness).fold(f64::INFINITY, f64::min);
+    let arc = opts.limit_arc_mm.min(thinnest).max(1e-3);
+    let step_of = |arc: f64, most: f64| if revolute { (arc / reach.max(1e-3)).to_degrees().clamp(opts.limit_min_step_deg, most) } else { arc };
+    let step = step_of(arc, opts.limit_max_step_deg);
+    let rest_step = step_of(opts.limit_rest_arc_mm.max(arc), opts.limit_max_rest_step_deg.max(opts.limit_max_step_deg));
+    let mut args = obj! {
+        "joint" => name, "unit" => if revolute { "deg" } else { "mm" }, "range" => range, "step" => (step * 1e6).round() / 1e6, "rest_step" => (rest_step * 1e6).round() / 1e6,
+        "refine" => opts.limit_refine_mm, "budget_s" => opts.limit_budget_s,
+        "occurrences" => Json::Arr(movers.iter().map(|v| var(v)).collect()), "against" => Json::Arr(against.iter().map(|v| var(v)).collect()),
+    };
+    if on_pivot > 0 {
+        args.set("left_out_on_pivot", on_pivot);
+    }
+    if capped > 0 {
+        args.set("left_out_far", capped);
+    }
+    let what = if against.is_empty() { "nothing it can meet".to_string() } else { format!("{} part(s) it can meet", against.len()) };
+    Step::tool("joint_limits", args, format!("limits of {name}: {} moving part(s) against {what}", movers.len())).soft().group("limits")
 }
 
 /// What a rigid group is, from its members' reasons.

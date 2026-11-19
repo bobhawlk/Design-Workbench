@@ -35,6 +35,7 @@ fn part(name: &str) -> DesignSteps {
             Step::tool("save", obj! {"path" => format!("/out/{name}.sc")}, format!("save {name}")).group("save"),
         ],
         notes: Vec::new(),
+        continues: false,
     }
 }
 
@@ -57,7 +58,7 @@ fn assembly() -> DesignSteps {
             .group("constraints"),
     );
     steps.push(Step::tool("save", obj! {"path" => "/out/Rig.sc"}, "save Rig").group("save"));
-    DesignSteps { name: "Rig".into(), file: "/out/Rig.sc".into(), steps, notes: Vec::new() }
+    DesignSteps { name: "Rig".into(), file: "/out/Rig.sc".into(), steps, notes: Vec::new(), continues: false }
 }
 
 fn statuses(r: &DesignResult) -> Vec<&'static str> {
@@ -289,6 +290,117 @@ fn limits_are_set_counted_and_reported_when_unknown() {
     assert!(matches!(&odd.status, Status::Skipped(w) if w.contains("no min or max")), "{:?}", odd.status);
 }
 
+/// The limits stage on an invented rig: an arm (occurrence 11) turning on a base (21), with a
+/// stop (22) it can meet; `sweeps` are SolidCraft's answers to `joint.sweep`, in order.
+fn limits_stage(record: &std::path::Path, sweeps: Vec<Json>) -> (StepResult, Recorder) {
+    let mut rec = Recorder::new();
+    for s in sweeps {
+        rec = rec.on("joint.sweep", Action::Answer(s), 1);
+    }
+    let stage = DesignSteps {
+        name: "Rig limits".into(),
+        file: "/out/Rig.sc".into(),
+        steps: vec![
+            Step::tool("open", obj! {"path" => "/out/Rig.sc"}, "open Rig").group("open"),
+            Step::tool(
+                "joint_limits",
+                obj! {"joint" => "Arm pivot", "unit" => "deg", "range" => 360.0, "step" => 1.0, "rest_step" => 5.0, "refine" => 0.02, "budget_s" => 5.0,
+                      "occurrences" => vec![var("occ:arm")], "against" => vec![var("occ:base"), var("occ:stop")],
+                      "record" => record.display().to_string(), "save" => "/out/Rig.sc"},
+                "limits of Arm pivot",
+            )
+            .soft()
+            .group("limits"),
+        ],
+        notes: Vec::new(),
+        continues: true,
+    };
+    let profile = Profile::builtin();
+    let r = {
+        let mut runner = Runner::new(&mut rec, &profile);
+        runner.preset.insert("occ:arm".into(), Json::from(11));
+        runner.preset.insert("occ:base".into(), Json::from(21));
+        runner.preset.insert("occ:stop".into(), Json::from(22));
+        runner.run(&stage)
+    };
+    (r.steps[1].clone(), rec)
+}
+
+fn contact(at: f64, a: &str, b: &str) -> Json {
+    obj! {"stopped_at" => at, "stopped_by" => obj!{"a" => a, "b" => b, "at" => vec![1.0, 2.0, 3.0]}, "budget_ran_out" => Json::Null}
+}
+
+fn clear() -> Json {
+    obj! {"stopped_at" => Json::Null, "stopped_by" => Json::Null, "budget_ran_out" => Json::Null}
+}
+
+fn sweeps_sent(rec: &Recorder) -> Vec<Json> {
+    rec.calls.iter().filter(|(_, a)| a.str_of("command") == Some("joint.sweep")).map(|(_, a)| a.get("params").cloned().unwrap_or_default()).collect()
+}
+
+#[test]
+fn the_limits_stage_sets_a_limit_only_from_a_contact_both_ways_and_takes_up_where_it_stopped() {
+    let dir = tmp("limits-stage");
+    let record = dir.join("limits-found.jsonl");
+    // The arm rests on the base where it starts: the first sweep (one step) says so.
+    let probe = obj! {"stopped_at" => Json::Null, "stopped_by" => Json::Null, "touching_parts" => vec![Json::Arr(vec![obj!{"path_ids" => vec![11]}, obj!{"path_ids" => vec![5, 21]}])]};
+    let (r, rec) = limits_stage(
+        &record,
+        vec![
+            probe.clone(),
+            contact(40.0, "Arm", "Stop"), // up, every pair but the resting one
+            clear(),                      // up, the resting pair as far as 40: nothing deeper
+            contact(-30.0, "Arm", "Stop"), // down
+            contact(-20.0, "Arm", "Base"), // down, the resting pair: it passes deeper first
+        ],
+    );
+    assert_eq!(r.status, Status::Done, "{:?}", r.status);
+    assert_eq!(r.data.str_of("result"), Some("contact"));
+    assert_eq!((r.data.f64_of("min"), r.data.f64_of("max")), (Some(-20.0), Some(40.0)));
+    let sent = sweeps_sent(&rec);
+    assert_eq!(sent.len(), 5);
+    // The resting pair is left out of the fine sweeps and swept alone at the coarser step, only as
+    // far as the fine sweep got.
+    assert_eq!(sent[1].get("exclude_pairs").map(Json::to_compact).as_deref(), Some("[[11,21]]"));
+    assert_eq!(sent[2].get("against").map(Json::to_compact).as_deref(), Some("[21]"));
+    assert_eq!((sent[2].f64_of("step"), sent[2].f64_of("to")), (Some(5.0), Some(40.0)));
+    assert_eq!(sent[3].f64_of("to"), Some(40.0 - 360.0), "down: as far as a turn below where the way up stopped");
+    let limits = rec.calls.iter().filter(|(_, a)| a.str_of("command") == Some("joint.limits")).map(|(_, a)| a.get("params").cloned().unwrap_or_default()).collect::<Vec<_>>();
+    assert!(limits[0].get("min").is_none(), "its own limit is cleared before the search");
+    assert_eq!((limits[1].f64_of("min"), limits[1].f64_of("max")), (Some(-20.0), Some(40.0)));
+    assert!(rec.calls.iter().any(|(t, a)| t == "save" && a.str_of("path") == Some("/out/Rig.sc")), "saved after the limit");
+
+    // Run again: taken from the record, not searched.
+    let (again, rec2) = limits_stage(&record, vec![]);
+    assert_eq!(again.status, Status::Done);
+    assert!(sweeps_sent(&rec2).is_empty());
+    assert!(again.note.contains("earlier run"), "{}", again.note);
+
+    // Nothing met a turn either way: no limit, and said so.
+    let _ = std::fs::remove_file(&record);
+    let (free, rec3) = limits_stage(&record, vec![clear(), clear()]);
+    assert_eq!(sweeps_sent(&rec3).len(), 2, "a whole turn up clear: the way down is the same poses");
+    assert!(matches!(&free.status, Status::Skipped(w) if w.contains("full turn")), "{:?}", free.status);
+    assert_eq!(free.data.str_of("result"), Some("free"));
+    assert!(!rec3.calls.iter().any(|(_, a)| a.str_of("command") == Some("joint.limits") && a.pointer("params/min").is_some()));
+
+    // Out of time one way: not found, no limit, and searched again next time.
+    let _ = std::fs::remove_file(&record);
+    let budget = obj! {"stopped_at" => 12.0, "stopped_by" => "budget", "budget_ran_out" => "time"};
+    let (late, _) = limits_stage(&record, vec![clear(), budget, contact(-30.0, "Arm", "Stop")]);
+    assert!(matches!(&late.status, Status::Skipped(w) if w.contains("not found in time") && w.contains("clear to 12")), "{:?}", late.status);
+    assert_eq!(late.data.str_of("result"), Some("not found"));
+    let (retry, rec4) = limits_stage(&record, vec![clear(), contact(50.0, "Arm", "Stop"), contact(-30.0, "Arm", "Stop")]);
+    assert_eq!(retry.status, Status::Done, "{:?}", retry.status);
+    assert_eq!(sweeps_sent(&rec4).len(), 3);
+
+    // A closed loop stopping it one way is not a contact: no limit.
+    let _ = std::fs::remove_file(&record);
+    let looped = obj! {"stopped_at" => 8.0, "stopped_by" => "loop", "budget_ran_out" => Json::Null};
+    let (lp, _) = limits_stage(&record, vec![clear(), contact(30.0, "Arm", "Stop"), looped]);
+    assert!(matches!(&lp.status, Status::Skipped(w) if w.contains("not stopped by a contact both ways")), "{:?}", lp.status);
+}
+
 // ---- 5: what a hard failure leaves out ----
 
 #[test]
@@ -450,6 +562,7 @@ fn the_mechanism_check_drives_each_joint_and_reports_what_holds_it() {
             .group("verification"),
         ],
         notes: Vec::new(),
+        continues: false,
     };
     let profile = Profile::builtin();
     let r = Runner::new(&mut rec, &profile).run(&design);
@@ -484,7 +597,7 @@ fn a_constraint_that_moves_a_part_is_undone_and_reported() {
             .group("constraints")
             .guard(vec![obj! {"occurrence" => "Lid:1"}])
     };
-    let design = DesignSteps { name: "Box".into(), file: "/out/Box.sc".into(), steps: vec![step("Stays"), step("Moves")], notes: Vec::new() };
+    let design = DesignSteps { name: "Box".into(), file: "/out/Box.sc".into(), steps: vec![step("Stays"), step("Moves")], notes: Vec::new(), continues: false };
     // Stays: read twice where it was. Moves: before, after (40 mm off), after the undo.
     let mut rec = Recorder::new().on("occurrence.properties", Action::Answer(at(0.0)), 3).on("occurrence.properties", Action::Answer(at(40.0)), 1).on("occurrence.properties", Action::Answer(at(0.0)), 1);
     let profile = Profile::builtin();

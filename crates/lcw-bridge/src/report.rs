@@ -199,15 +199,51 @@ fn result_summary(runs: &[DesignResult]) -> String {
         s.push_str(&format!("| {} | {} | {} | {} | {} | {} | {} |\n", cell(g), c[0], c[1], c[2], c[3], c[4], c[5]));
     }
     // Limits: what each joint ended with.
-    let limits: Vec<&StepResult> = runs.iter().flat_map(|r| &r.steps).filter(|x| x.op == "auto_limits").collect();
-    if !limits.is_empty() {
-        let set = limits.iter().filter(|x| x.status.achieved()).count();
-        let free = limits.iter().filter(|x| matches!(&x.status, Status::Skipped(w) if w.contains("nothing stops") || w.contains("turns freely"))).count();
-        s.push_str(&format!(
-            "\nJoint limits: {} planned, {set} set, {free} free (nothing stops the joint), {} not set (unknown or failed; listed below).\n",
-            limits.len(),
-            limits.len() - set - free
-        ));
+    s.push_str(&limits_summary(runs));
+    s.push('\n');
+    s
+}
+
+/// The limits stage's results, in a line.
+fn limits_summary(runs: &[DesignResult]) -> String {
+    let found: Vec<&StepResult> = runs.iter().flat_map(|r| &r.steps).filter(|x| x.op == "joint_limits").collect();
+    if found.is_empty() {
+        return String::new();
+    }
+    let count = |r: &str| found.iter().filter(|x| x.data.str_of("result") == Some(r)).count();
+    let set = found.iter().filter(|x| x.status.achieved()).count();
+    let secs: f64 = found.iter().map(|x| x.ms).sum::<f64>() / 1000.0;
+    format!(
+        "\nJoint limits: {} searched in {secs:.0} s; {set} set at a contact stop both ways, {} free (nothing stops them within a turn or their reach), {} not found in time, {} stopped otherwise (a closed loop, a contact one way only), {} failed or not run.\n",
+        found.len(),
+        count("free"),
+        count("not found"),
+        count("loop") + count("one side"),
+        found.len() - set - count("free") - count("not found") - count("loop") - count("one side"),
+    )
+}
+
+/// Each joint's travel search: what ended it each way and the limits set.
+pub fn limits_section(runs: &[DesignResult]) -> String {
+    let found: Vec<&StepResult> = runs.iter().flat_map(|r| &r.steps).filter(|x| x.op == "joint_limits").collect();
+    let mut s = String::from("## Travel limits\n");
+    s.push_str(&limits_summary(runs));
+    s.push_str("\nA limit is set only where the search ends at a contact both ways.\n\n| Joint | Result | Limits | What ended it | s |\n|---|---|---|---|---|\n");
+    for x in found {
+        let d = &x.data;
+        let joint = d.str_of("joint").unwrap_or(x.label.as_str());
+        let result = match (d.str_of("result"), &x.status) {
+            (Some("contact"), st) if st.achieved() => "contact stop".to_string(),
+            (Some("free"), _) => "no stop".to_string(),
+            (Some(r), _) => r.to_string(),
+            (None, st) => st.name().to_string(),
+        };
+        let lim = match (d.f64_of("min"), d.f64_of("max")) {
+            (Some(lo), Some(hi)) if x.status.achieved() => format!("{} to {} {}", fmt_num(Some(lo)), fmt_num(Some(hi)), d.str_of("unit").unwrap_or("")),
+            _ => "none".to_string(),
+        };
+        let why = d.str_of("text").map(str::to_string).unwrap_or_else(|| x.status.detail().to_string());
+        s.push_str(&format!("| {} | {} | {} | {} | {:.1} |\n", cell(joint), result, lim, cell(&why), x.ms / 1000.0));
     }
     s.push('\n');
     s
@@ -216,9 +252,9 @@ fn result_summary(runs: &[DesignResult]) -> String {
 /// Per joint: where it came from, whether SolidCraft made it, its limits, and whether the check
 /// could drive it; then the mechanism's degrees of freedom, conflicts and floating chains.
 fn mechanism_section(a: &Analysis, runs: &[DesignResult]) -> String {
-    let Some(asm) = runs.last() else { return String::new() };
+    let Some(asm) = runs.iter().rev().find(|r| r.steps.iter().any(|x| x.group == "joints" || x.group == "rigid groups")).or(runs.last()) else { return String::new() };
     let mut s = String::from("## Mechanism\n\n");
-    let check = asm.steps.iter().find(|x| x.op == "verify_joints");
+    let check = runs.iter().rev().flat_map(|r| &r.steps).find(|x| x.op == "verify_joints");
     let data = check.map(|c| c.data.clone()).unwrap_or_default();
     let checked = data.get("joints").and_then(Json::as_array).map(<[Json]>::to_vec).unwrap_or_default();
     match check.map(|c| &c.status) {
@@ -244,7 +280,7 @@ fn mechanism_section(a: &Analysis, runs: &[DesignResult]) -> String {
             Some(st) => format!("{}: {}", st.name(), st.detail()),
             None => "not attempted (see notes)".to_string(),
         };
-        let lim = asm.steps.iter().find(|x| x.op == "auto_limits" && x.label == format!("limit {name}"));
+        let lim = runs.iter().flat_map(|r| &r.steps).find(|x| (x.op == "auto_limits" && x.label == format!("limit {name}")) || (x.op == "joint_limits" && x.data.str_of("joint") == Some(name.as_str())));
         let c = checked.iter().find(|c| c.str_of("joint") == Some(name.as_str()));
         let lim_text = match (c.and_then(|c| c.get("limits")).and_then(Json::as_array), lim.map(|x| &x.status)) {
             (Some(l), _) if l.len() == 2 => format!("{} to {} {}", fmt_num(l[0].as_f64()), fmt_num(l[1].as_f64()), c.and_then(|c| c.str_of("unit")).unwrap_or("")),
@@ -462,10 +498,11 @@ mod tests {
             ms: 4000.0,
             stopped: Some("not run: step 2 (place Widget:1) failed, and the rest of this design needs it".into()),
             session_lost: None,
+            vars: Default::default(),
             steps: vec![
                 step("place Widget:1", "placement", "place", Status::Failed("occurrence 7: not rigid\nsecond line of the error".into())),
                 step("mate M1", "constraints", "constraint", Status::Fallback("joint".into())),
-                step("limit Hinge", "limits", "auto_limits", Status::Skipped("limit not set, one end unknown: min unknown".into())),
+                StepResult { data: lcw_json::obj! {"joint" => "Hinge", "result" => "not found", "text" => "not found in time: no limit set"}, ..step("limits of Hinge", "limits", "joint_limits", Status::Skipped("not found in time: no limit set".into())) },
                 step("place Widget:2", "placement", "place", Status::NotRun("not run: step 2 (place Widget:1) failed, and the rest of this design needs it".into())),
                 step("save", "save", "save", Status::Done),
             ],
@@ -475,17 +512,19 @@ mod tests {
         assert!(md.contains("second line of the error"), "the whole error text: {md}");
         assert!(md.contains("1 not run (step 2 (place Widget:1) failed, and the rest of this design needs it): place Widget:2"), "{md}");
         assert!(md.contains("by fallback: mate M1: joint"), "{md}");
-        assert!(md.contains("skipped: limit Hinge: limit not set, one end unknown"), "{md}");
+        assert!(md.contains("skipped: limits of Hinge: not found in time"), "{md}");
         assert!(md.contains("SolidCraft was started again"));
         assert!(md.contains("| `cmd.place` | 2 |") || md.contains("| `cmd.place` | 1 |"), "time per command: {md}");
-        let summary = result_summary(&[run]);
+        let summary = result_summary(std::slice::from_ref(&run));
         assert!(summary.contains("| placement | 2 | 0 | 0 | 0 | 1 | 1 |"), "{summary}");
-        assert!(summary.contains("Joint limits: 1 planned, 0 set, 0 free"), "{summary}");
+        assert!(summary.contains("Joint limits: 1 searched") && summary.contains("0 set at a contact stop both ways") && summary.contains("1 not found in time"), "{summary}");
+        let lim = limits_section(&[run]);
+        assert!(lim.contains("| Hinge | not found | none | not found in time: no limit set |"), "{lim}");
     }
 
     #[test]
     fn a_part_is_built_as_what_its_steps_achieved() {
-        let mut r = DesignResult { name: "P".into(), file: "p.sc".into(), saved: true, ms: 0.0, stopped: None, session_lost: None, steps: vec![step("make P sheet metal", "sheet metal", "sheet_convert", Status::Failed("sew: the faces do not close".into()))] };
+        let mut r = DesignResult { name: "P".into(), file: "p.sc".into(), saved: true, ms: 0.0, stopped: None, session_lost: None, vars: Default::default(), steps: vec![step("make P sheet metal", "sheet metal", "sheet_convert", Status::Failed("sew: the faces do not close".into()))] };
         assert_eq!(built_as(Some(&r), true), "solid (sheet metal conversion failed)");
         r.steps[0].status = Status::Done;
         assert_eq!(built_as(Some(&r), true), "sheet metal");

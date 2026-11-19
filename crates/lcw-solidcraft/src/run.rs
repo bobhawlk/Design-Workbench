@@ -93,6 +93,8 @@ pub struct DesignResult {
     pub stopped: Option<String>,
     /// The SolidCraft session was given up while this design was built (it was not saved).
     pub session_lost: Option<String>,
+    /// The ids bound when it finished (for a later stage on the same design).
+    pub vars: BTreeMap<String, Json>,
 }
 
 impl DesignResult {
@@ -164,6 +166,8 @@ pub struct Runner<'a> {
     pub transport: &'a mut dyn Transport,
     pub profile: &'a Profile,
     pub vars: BTreeMap<String, Json>,
+    /// Ids bound before any step runs (the assembly's, for a limits stage run on its own).
+    pub preset: BTreeMap<String, Json>,
     /// Print each step as it runs (when there is no observer).
     pub verbose: bool,
     /// The least time any call may take before it is given up (`--timeout`); `None`: the
@@ -190,6 +194,7 @@ impl<'a> Runner<'a> {
             transport,
             profile,
             vars: BTreeMap::new(),
+            preset: BTreeMap::new(),
             verbose: false,
             timeout: None,
             batch: 0,
@@ -309,6 +314,9 @@ impl<'a> Runner<'a> {
         }
         if step.tool == "verify_joints" {
             return self.verify_joints(&args);
+        }
+        if step.tool == "joint_limits" {
+            return self.joint_limits(&args);
         }
         // Where the guarded placements are before the step.
         let guard: Vec<Json> = step.guard.iter().map(|g| substitute(g, &|n| self.lookup(n), &mut Vec::new())).collect();
@@ -480,7 +488,8 @@ impl<'a> Runner<'a> {
                 // The closed loop the joint is in stops it; a limit of its own would lock the loop
                 // where the sweep of this one joint met it.
                 Json::Str(s) if s == "loop" => (false, "the closed loop it is in stops it, so it needs no limit of its own".to_string()),
-                Json::Str(s) => (true, format!("stopped by {s}")),
+                // Only a contact is a stop: anything else (another joint's limit…) is not this joint's.
+                Json::Str(s) => (false, format!("stopped by {s}, not by a contact")),
                 Json::Obj(_) => {
                     let names: Vec<&str> = ["a", "b"].iter().filter_map(|n| by.str_of(n)).collect();
                     (true, if names.len() == 2 { format!("stopped where {} meets {}", names[0], names[1]) } else { "stopped by contact".to_string() })
@@ -516,6 +525,270 @@ impl<'a> Runner<'a> {
             Err(e) if e.ends_session() => Outcome::lost(&e, &format!("setting the limits of {jname}")),
             Err(e) => Outcome::of(Status::Failed(e.message().to_string())),
         }
+    }
+
+    /// The limits stage's search for one joint (`joint_limits`): its value swept with the `sweep`
+    /// op from where it is, up by `range` (a turn, or the parts' reach) and then down by as much
+    /// from where that stopped, the moving parts (`occurrences`) checked against the parts they
+    /// can meet (`against`), with `budget_s` each way. A limit is set only where both ways end
+    /// at a contact; every other ending is reported as what it is: nothing stops it (a full turn,
+    /// or the whole reach), not found in time, or a closed loop stops it. Each result is appended
+    /// to `record` (a JSON-lines file) as it is found and the design saved to `save` after a limit
+    /// is set, so a stage cut short is taken up from there: a joint already in the record is not
+    /// searched again (one not found in time is).
+    fn joint_limits(&mut self, args: &Json) -> Outcome {
+        let lp = self.profile.limits.clone();
+        let key = |k: &str| lp.str_of(k).unwrap_or(k).to_string();
+        let joint = args.get("joint").cloned().unwrap_or_default();
+        let jname = joint.as_str().map(str::to_string).unwrap_or_else(|| joint.to_compact());
+        let unit = args.str_of("unit").unwrap_or("deg").to_string();
+        let record = args.str_of("record").map(str::to_string);
+        let t0 = Instant::now();
+        // Taken up from an earlier run of the stage.
+        if let Some(prev) = record.as_deref().and_then(|r| earlier_result(r, &jname)) {
+            let result = prev.str_of("result").unwrap_or("").to_string();
+            let text = prev.str_of("text").unwrap_or("").to_string();
+            if result == "contact" {
+                if let (Some(lo), Some(hi)) = (prev.f64_of("min"), prev.f64_of("max")) {
+                    let t = self.profile.timeout_for(Some("set_limits"), "execute", self.timeout);
+                    return match self.execute_op("set_limits", &obj! {"joint" => joint.clone(), "index" => 0, "min" => lo, "max" => hi}, t) {
+                        Ok(_) => Outcome { status: Status::Done, note: format!("{text} (found by an earlier run of the limits stage)"), data: prev.clone(), lost: None },
+                        Err(e) if e.ends_session() => Outcome::lost(&e, &format!("setting the limits of {jname}")),
+                        Err(e) => Outcome::of(Status::Failed(e.message().to_string())),
+                    };
+                }
+            } else if result != "not found" && result != "error" && !result.is_empty() {
+                return Outcome { status: Status::Skipped(format!("{text} (found by an earlier run of the limits stage)")), note: String::new(), data: prev.clone(), lost: None };
+            }
+        }
+        let finish = |runner: &mut Runner, data: Json, status: Status| -> Outcome {
+            if let Some(r) = &record {
+                let mut line = data.clone();
+                line.set("seconds", (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0);
+                let _ = append_line(r, &line);
+            }
+            let mut o = Outcome { status, note: String::new(), data, lost: None };
+            if o.status == Status::Done {
+                if let Some(path) = args.str_of("save") {
+                    let t = runner.profile.timeout_for(None, "save", runner.timeout);
+                    if let Err(e) = runner.send("save", obj! {"path" => path}, t) {
+                        if e.ends_session() {
+                            return Outcome::lost(&e, &format!("saving after the limits of {jname}"));
+                        }
+                        o.note = format!("the design could not be saved after this limit: {}", e.message());
+                    }
+                }
+            }
+            o
+        };
+        let movers = args.arr_of("occurrences").to_vec();
+        let against = args.arr_of("against").to_vec();
+        let base = obj! {"joint" => jname.as_str(), "unit" => unit.as_str()};
+        if movers.is_empty() || against.is_empty() {
+            let mut d = base.clone();
+            d.set("result", "free");
+            d.set("text", "nothing it can meet anywhere on its travel, so nothing stops it: no limit");
+            return finish(self, d, Status::Skipped("nothing it can meet anywhere on its travel, so nothing stops it: no limit".into()));
+        }
+        // Where the joint is now: the searches start there.
+        let mp = self.profile.mechanism.get("list").cloned().unwrap_or_default();
+        let mkey = |k: &str| mp.str_of(k).unwrap_or(k).to_string();
+        let t = self.profile.timeout_for(Some("joint_list"), "execute", self.timeout);
+        let now = match self.execute_op("joint_list", &obj! {"quiet" => false}, t) {
+            Ok(r) => r
+                .pointer(&mkey("joints"))
+                .and_then(Json::as_array)
+                .and_then(|l| l.iter().find(|x| x.str_of(&mkey("joint_name")) == Some(jname.as_str())).cloned())
+                .and_then(|x| x.get(&mkey("joint_values")).and_then(Json::as_array).and_then(|a| a.first()).and_then(|v| v.f64_of(&mkey("value"))))
+                .unwrap_or(0.0),
+            Err(e) if e.ends_session() => return Outcome::lost(&e, "listing the joints"),
+            Err(_) => 0.0,
+        };
+        // A limit of its own (from an earlier search) would stop the sweeps: cleared first. Only
+        // joints with no limit from Inventor are searched, so any limit there is a search's.
+        let t = self.profile.timeout_for(Some("set_limits"), "execute", self.timeout);
+        if let Err(e) = self.execute_op("set_limits", &obj! {"joint" => joint.clone(), "index" => 0}, t) {
+            if e.ends_session() {
+                return Outcome::lost(&e, &format!("clearing the limits of {jname}"));
+            }
+        }
+        let range = args.f64_of("range").unwrap_or(360.0);
+        let budget = args.f64_of("budget_s").unwrap_or(30.0);
+        let slack = lp.f64_of("slack_s").unwrap_or(120.0);
+        let timeout = self.profile.timeout_for(Some("sweep"), "execute", self.timeout).max(Duration::from_secs_f64(budget + slack));
+        // One sweep: what ended it, and its reply.
+        let sweep = |runner: &mut Runner, occ: &[Json], against: &[Json], exclude: &[Json], step: Option<Json>, to: f64| -> Result<(End, Json), Outcome> {
+            let mut p = obj! {"joint" => joint.clone(), "index" => 0, "from" => now, "to" => to, "occurrences" => Json::Arr(occ.to_vec()), "against" => Json::Arr(against.to_vec()), "budget_s" => budget, "apply" => false};
+            if !exclude.is_empty() {
+                p.set("exclude_pairs", Json::Arr(exclude.to_vec()));
+            }
+            if let Some(st) = step {
+                p.set("step", st);
+            }
+            if let Some(v) = args.get("refine").filter(|v| !v.is_null()) {
+                p.set("refine", v.clone());
+            }
+            match runner.execute_op("sweep", &p, timeout) {
+                Ok(r) => {
+                    let at = r.pointer(&key("stopped_at")).and_then(Json::as_f64);
+                    let by = r.pointer(&key("stopped_by")).cloned().unwrap_or(Json::Null);
+                    let ran = r.pointer(&key("ran_out")).and_then(Json::as_str).map(str::to_string);
+                    let end = match (&by, at) {
+                        (Json::Obj(_), Some(v)) => {
+                            let pt = by.get(&key("contact_at")).and_then(Json::as_array).map(|a| a.iter().filter_map(Json::as_f64).map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>()).unwrap_or_default();
+                            End::Contact { at: v, a: by.str_of(&key("contact_a")).unwrap_or("?").to_string(), b: by.str_of(&key("contact_b")).unwrap_or("?").to_string(), point: pt }
+                        }
+                        (Json::Str(s), v) if *s == key("budget") => End::Budget { at: v, ran_out: ran.unwrap_or_else(|| "work".into()) },
+                        (Json::Str(s), v) if *s == key("loop") => End::Other { at: v, why: "the closed loop it is in stops it".into() },
+                        (Json::Str(s), v) if *s == key("limit") => End::Other { at: v, why: "another joint's limit stops it".into() },
+                        (Json::Str(s), v) => End::Other { at: v, why: format!("stopped by {s}") },
+                        (Json::Null, _) => End::Clear,
+                        _ => End::Other { at, why: format!("an answer it does not understand ({})", clip(&by.to_compact(), 120)) },
+                    };
+                    Ok((end, r))
+                }
+                Err(e) if e.ends_session() => Err(Outcome::lost(&e, &format!("searching the travel of {jname}"))),
+                Err(e) => Ok((End::Error(e.message().to_string()), Json::Null)),
+            }
+        };
+        let step = args.get("step").filter(|v| !v.is_null()).cloned();
+        let rest_step = args.get("rest_step").filter(|v| !v.is_null()).cloned().or_else(|| step.clone());
+        // Parts already touching where it starts (a lever on its bracket, a pin in a hole) stop it
+        // only by passing into each other deeper than they start, and measuring that at every
+        // sample is most of a search's work. So each way is searched in two sweeps: every other
+        // pair at the fine step, then the touching pairs alone at `rest_step`, only as far as the
+        // first stopped (its travel since the touch is continuous from contact, so a coarser
+        // step does not jump over it). The earlier stop of the two ends that way.
+        let first = args.f64_of("step").unwrap_or(1.0).max(1e-6);
+        let (_, probe) = match sweep(self, &movers, &against, &[], step.clone(), now + first) {
+            Ok(x) => x,
+            Err(o) => return o,
+        };
+        let ids = |list: &[Json]| -> Vec<u64> { list.iter().filter_map(Json::as_u64).collect() };
+        let (mover_ids, against_ids) = (ids(&movers), ids(&against));
+        let mut resting: Vec<(u64, u64)> = Vec::new();
+        for pair in probe.pointer(&key("touching_parts")).and_then(Json::as_array).unwrap_or(&[]) {
+            let member = |side: Option<&Json>, set: &[u64]| -> Option<u64> { side?.get(&key("path_ids"))?.as_array()?.iter().filter_map(Json::as_u64).rev().find(|id| set.contains(id)) };
+            let (x, y) = (pair.as_array().and_then(|p| p.first()), pair.as_array().and_then(|p| p.get(1)));
+            let pick = match (member(x, &mover_ids), member(y, &against_ids), member(y, &mover_ids), member(x, &against_ids)) {
+                (Some(m), Some(o), _, _) | (_, _, Some(m), Some(o)) => Some((m, o)),
+                _ => None,
+            };
+            if let Some(p) = pick {
+                if !resting.contains(&p) {
+                    resting.push(p);
+                }
+            }
+        }
+        let exclude: Vec<Json> = resting.iter().map(|(m, o)| Json::Arr(vec![Json::from(*m as f64), Json::from(*o as f64)])).collect();
+        let mut rest_movers: Vec<Json> = Vec::new();
+        let mut rest_against: Vec<Json> = Vec::new();
+        for (m, o) in &resting {
+            if !rest_movers.iter().any(|x| x.as_u64() == Some(*m)) {
+                rest_movers.push(Json::from(*m as f64));
+            }
+            if !rest_against.iter().any(|x| x.as_u64() == Some(*o)) {
+                rest_against.push(Json::from(*o as f64));
+            }
+        }
+        let mut sweeps = 1usize;
+        let mut side = |runner: &mut Runner, to: f64| -> Result<End, Outcome> {
+            // Every pair but the touching ones (when every pair touches, there is nothing to do here).
+            let all_resting = against_ids.iter().all(|o| resting.iter().any(|(_, x)| x == o)) && mover_ids.iter().all(|m| resting.iter().any(|(x, _)| x == m)) && resting.len() == mover_ids.len() * against_ids.len();
+            let a = if all_resting {
+                End::Clear
+            } else {
+                sweeps += 1;
+                sweep(runner, &movers, &against, &exclude, step.clone(), to)?.0
+            };
+            if resting.is_empty() {
+                return Ok(a);
+            }
+            let until = match &a {
+                End::Contact { at, .. } => *at,
+                End::Budget { at: Some(v), .. } | End::Other { at: Some(v), .. } => *v,
+                End::Error(_) => return Ok(a),
+                _ => to,
+            };
+            if (until - now).abs() < 1e-9 {
+                return Ok(a);
+            }
+            sweeps += 1;
+            let b = sweep(runner, &rest_movers, &rest_against, &[], rest_step.clone(), until)?.0;
+            Ok(match b {
+                End::Contact { .. } | End::Error(_) => b,
+                // The touching pairs not checked all the way: not found that far.
+                End::Budget { at, ran_out } => match a {
+                    End::Budget { at: aa, .. } => End::Budget { at: match (at, aa) { (Some(x), Some(y)) => Some(if to > now { x.min(y) } else { x.max(y) }), (x, y) => x.or(y) }, ran_out },
+                    _ => End::Budget { at, ran_out },
+                },
+                _ => a,
+            })
+        };
+        let up = match side(self, now + range) {
+            Ok(e) => e,
+            Err(o) => return o,
+        };
+        // Down from where it is, as far as a turn below where the way up stopped (so a span of at
+        // most a turn), or the whole reach.
+        let down_to = match (&up, unit.as_str()) {
+            (End::Contact { at, .. }, "deg") => at - range,
+            _ => now - range,
+        };
+        // A whole turn up with nothing met has been through every pose the way down would see.
+        let down = if matches!(up, End::Clear) && unit == "deg" && range >= 360.0 - 1e-9 {
+            End::Clear
+        } else {
+            match side(self, down_to) {
+                Ok(e) => e,
+                Err(o) => return o,
+            }
+        };
+        drop(side);
+        let way = |e: &End, w: &str| -> String {
+            match e {
+                End::Contact { at, a, b, point } => format!("{w} {} {unit}: {a} meets {b}{}", fmt3(*at), if point.len() == 3 { format!(" at ({}, {}, {})", point[0], point[1], point[2]) } else { String::new() }),
+                End::Clear => format!("{w}: nothing met {}", if unit == "deg" { "within a turn" } else { "within the parts' reach" }),
+                End::Budget { at, ran_out } => format!("{w}: not found ({} budget ran out{})", ran_out, at.map(|v| format!("; clear to {} {unit}", fmt3(v))).unwrap_or_default()),
+                End::Other { at, why } => format!("{w}: {why}{}", at.map(|v| format!(" at {} {unit}", fmt3(v))).unwrap_or_default()),
+                End::Error(e) => format!("{w}: the search failed ({})", clip(e, 200)),
+            }
+        };
+        let text_of = |head: &str| format!("{head} ({}; {})", way(&down, "min"), way(&up, "max"));
+        let mut d = base.clone();
+        d.set("touching_pairs", resting.len());
+        d.set("sweeps", sweeps);
+        d.set("min_by", down.json());
+        d.set("max_by", up.json());
+        let (result, status) = match (&down, &up) {
+            (End::Contact { at: lo, .. }, End::Contact { at: hi, .. }) if hi - lo > 1e-6 => {
+                d.set("min", *lo);
+                d.set("max", *hi);
+                let t = self.profile.timeout_for(Some("set_limits"), "execute", self.timeout);
+                match self.execute_op("set_limits", &obj! {"joint" => joint.clone(), "index" => 0, "min" => *lo, "max" => *hi}, t) {
+                    Ok(_) => ("contact", Status::Done),
+                    Err(e) if e.ends_session() => return Outcome::lost(&e, &format!("setting the limits of {jname}")),
+                    Err(e) => ("error", Status::Failed(format!("{}: {}", text_of("both ways stop at a contact, but setting the limits failed"), e.message()))),
+                }
+            }
+            (End::Contact { .. }, End::Contact { .. }) => ("contact", Status::Skipped(text_of("limit not set: the travel between the two contacts is empty"))),
+            (End::Clear, End::Clear) => ("free", Status::Skipped(text_of(if unit == "deg" { "a full turn: nothing stops it, no limit" } else { "nothing stops it within its reach: no limit" }))),
+            (End::Error(_), _) | (_, End::Error(_)) => ("error", Status::Failed(text_of("the search failed"))),
+            (End::Budget { .. }, _) | (_, End::Budget { .. }) => ("not found", Status::Skipped(text_of("not found in time: no limit set"))),
+            (End::Other { .. }, _) | (_, End::Other { .. }) => ("loop", Status::Skipped(text_of("not stopped by a contact both ways: no limit set"))),
+            _ => ("one side", Status::Skipped(text_of("a contact one way only: no limit set"))),
+        };
+        d.set("result", result);
+        let text = match &status {
+            Status::Done => text_of("contact stop both ways: limits set"),
+            st => st.detail().to_string(),
+        };
+        d.set("text", text.as_str());
+        let mut o = finish(self, d, status);
+        if o.status == Status::Done && o.note.is_empty() {
+            o.note = text;
+        }
+        o
     }
 
     /// Check the mechanism SolidCraft solved: degrees of freedom, conflicts and floating chains
@@ -833,17 +1106,24 @@ impl<'a> Runner<'a> {
         if let Some(o) = self.observer.as_deref_mut() {
             o.design_started(design);
         }
-        // Ids from another design (or another session) mean nothing here.
-        self.vars.clear();
+        // Ids from another design (or another session) mean nothing here, unless this design
+        // works on the one before it.
+        if !design.continues {
+            self.vars.clear();
+        }
+        for (k, v) in &self.preset {
+            self.vars.entry(k.clone()).or_insert_with(|| v.clone());
+        }
         if let Some(d) = &self.steps_dir {
             self.vars.insert(STEPS_DIR.to_string(), Json::from(d.as_str()));
         }
-        let mut out = DesignResult { name: design.name.clone(), file: design.file.clone(), saved: false, steps: Vec::new(), ms: 0.0, stopped: None, session_lost: None };
+        let mut out = DesignResult { name: design.name.clone(), file: design.file.clone(), saved: false, steps: Vec::new(), ms: 0.0, stopped: None, session_lost: None, vars: BTreeMap::new() };
         if let Some(dead) = self.dead.clone() {
             for (i, step) in design.steps.iter().enumerate() {
                 self.finish(design, &mut out, i, StepResult::new(step, Status::NotRun(dead.clone())), None);
             }
             out.ms = t0.elapsed().as_secs_f64() * 1000.0;
+            out.vars = self.vars.clone();
             if let Some(o) = self.observer.as_deref_mut() {
                 o.design_finished(&out);
             }
@@ -895,6 +1175,7 @@ impl<'a> Runner<'a> {
             i += 1;
         }
         out.ms = t0.elapsed().as_secs_f64() * 1000.0;
+        out.vars = self.vars.clone();
         if let Some(o) = self.observer.as_deref_mut() {
             o.design_finished(&out);
         }
@@ -924,6 +1205,49 @@ impl<'a> Runner<'a> {
         }
         out.steps.push(sr);
     }
+}
+
+/// How one way of a limits search ended.
+enum End {
+    /// At a contact: the last value clear of it, the two parts, where they touch.
+    Contact { at: f64, a: String, b: String, point: Vec<f64> },
+    /// It got all the way (a turn, or the reach) without meeting anything.
+    Clear,
+    /// Its time (or work) ran out first: the last value checked clear.
+    Budget { at: Option<f64>, ran_out: String },
+    /// A closed loop or another joint's limit stopped it.
+    Other { at: Option<f64>, why: String },
+    Error(String),
+}
+
+impl End {
+    fn json(&self) -> Json {
+        match self {
+            End::Contact { at, a, b, point } => obj! {"stop" => "contact", "at" => *at, "a" => a.as_str(), "b" => b.as_str(), "point" => Json::Arr(point.iter().map(|x| Json::from(*x)).collect())},
+            End::Clear => obj! {"stop" => "none"},
+            End::Budget { at, ran_out } => obj! {"stop" => "not found", "ran_out" => ran_out.as_str(), "clear_to" => at.map(Json::from).unwrap_or(Json::Null)},
+            End::Other { at, why } => obj! {"stop" => "other", "why" => why.as_str(), "at" => at.map(Json::from).unwrap_or(Json::Null)},
+            End::Error(e) => obj! {"stop" => "error", "error" => e.as_str()},
+        }
+    }
+}
+
+fn fmt3(v: f64) -> String {
+    let s = format!("{v:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// The last line about `joint` in a limits record (JSON lines), if any.
+fn earlier_result(path: &str, joint: &str) -> Option<Json> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().filter_map(|l| Json::parse(l).ok()).filter(|j| j.str_of("joint") == Some(joint)).last()
+}
+
+fn append_line(path: &str, j: &Json) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{}", j.to_compact())?;
+    f.flush()
 }
 
 /// At most `n` characters of `s`.
@@ -974,6 +1298,7 @@ mod tests {
                 Step::tool("save", obj! {"path" => "t.sc"}, "save"),
             ],
             notes: Vec::new(),
+            continues: false,
         };
         let mut runner = Runner::new(&mut rec, &profile);
         let r = runner.run(&design);

@@ -10,12 +10,12 @@ use std::time::{Duration, SystemTime};
 use lcw_analyze::model::Model;
 use lcw_analyze::{analyze, Analysis, Merge, Options};
 use lcw_json::Json;
-use lcw_solidcraft::emit::{assembly_steps, part_steps, BuildPlan, Options as EmitOptions};
+use lcw_solidcraft::emit::{assembly_plan, part_steps, BuildPlan, Options as EmitOptions, LIMITS_RECORD};
 use lcw_solidcraft::mcp::{Launch, McpClient, Transport};
 use lcw_solidcraft::profile::{Profile, DEFAULT_TIMEOUT};
 use lcw_solidcraft::progress::ProgressSink;
 use lcw_solidcraft::run::{DesignResult, Runner};
-use lcw_solidcraft::steps::{designs_from_json, relative_path, DesignSteps};
+use lcw_solidcraft::steps::{designs_from_json, limits_from_json, relative_path, DesignSteps};
 
 const USAGE: &str = "inv2sc — Inventor assemblies into editable SolidCraft assemblies
 
@@ -24,6 +24,11 @@ USAGE:
   inv2sc analyze <bundle-folder | bundle.json | assembly.stp> [options]   (no SolidCraft needed)
   inv2sc watch <folder> [options]       convert each bundle that appears in <folder>
   inv2sc run <build-steps.json> [options]   build from a steps file written earlier
+  inv2sc limits <folder convert wrote> [--redo] [options]
+                find each joint's travel limits in a built assembly (the stage convert runs
+                after the assembly; after `convert --no-limits`, or to take up a stage that was
+                cut short: joints already in limits-found.jsonl are not searched again, except
+                those not found in time; --redo searches them all). Writes limits-report.md.
   inv2sc probe [--solidcraft-cli PATH] [--connect HOST:PORT] [--profile FILE]
   inv2sc verify <bundle-folder | bundle.json> [--built DIR] [--assembly FILE] [options]
                 check a finished build against the bundle: parts, placements, names, overall
@@ -42,7 +47,8 @@ OPTIONS:
   --merge MODE            identical parts with different files: report | same-name (default) | all
   --no-sheet-metal        bring every part in as a plain solid
   --no-infer              don't infer joints for unconstrained parts (they're held rigid)
-  --no-limits             don't search each joint's travel for its limits
+  --no-limits             don't search each joint's travel for its limits (`inv2sc limits`
+                          can do it later)
   --no-patterns           don't make pattern spacing a parameter
   --max-thickness MM      thickest plate treated as sheet metal (default 6)
   --path-map FROM=TO      write paths for another machine: build steps made here name
@@ -94,6 +100,7 @@ struct Args {
     tol_deg: Option<f64>,
     clash_budget: Option<f64>,
     no_clash: bool,
+    redo: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -125,6 +132,7 @@ fn parse_args() -> Result<Args, String> {
         tol_deg: None,
         clash_budget: None,
         no_clash: false,
+        redo: false,
     };
     while let Some(x) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -156,6 +164,7 @@ fn parse_args() -> Result<Args, String> {
             "--tol-deg" => a.tol_deg = Some(value("--tol-deg")?.parse().map_err(|_| "--tol-deg takes a number of degrees")?),
             "--clash-budget" => a.clash_budget = Some(value("--clash-budget")?.parse().map_err(|_| "--clash-budget takes a number of seconds")?),
             "--no-clash" => a.no_clash = true,
+            "--redo" => a.redo = true,
             "--timeout" => {
                 let secs: f64 = value("--timeout")?.parse().map_err(|_| "--timeout takes a number of seconds")?;
                 if !(secs.is_finite() && secs > 0.0) {
@@ -261,6 +270,10 @@ fn spawn(a: &Args, allow: &[&Path]) -> Result<McpClient, String> {
 type Built = (Vec<DesignResult>, Vec<String>, Vec<String>);
 
 fn build(a: &Args, dir: &Path, steps_dir: &Path, designs: &[&DesignSteps], assembly_last: bool) -> Result<Built, String> {
+    build_with(a, dir, steps_dir, designs, assembly_last, BTreeMap::new())
+}
+
+fn build_with(a: &Args, dir: &Path, steps_dir: &Path, designs: &[&DesignSteps], assembly_last: bool, preset: BTreeMap<String, Json>) -> Result<Built, String> {
     let mut sink = ProgressSink::new(Some(dir.join("progress.json")), Some(dir.join("build-log.jsonl")))?;
     sink.print = !a.quiet;
     sink.verbose = a.verbose;
@@ -284,6 +297,7 @@ fn build(a: &Args, dir: &Path, steps_dir: &Path, designs: &[&DesignSteps], assem
         runner.timeout = a.timeout;
         runner.batch = a.batch;
         runner.steps_dir = Some(abs(steps_dir));
+        runner.preset = preset;
         runner.observer = Some(&mut sink);
         let runs = runner.run_all(designs);
         (runs, runner.events.clone())
@@ -373,9 +387,10 @@ fn convert(a: &Args, input: &Path) -> Result<bool, String> {
         part_files.insert(*def, file);
     }
     let asm_file = target(&out.join(format!("{}.sc", analysis.model.defs[analysis.model.root].key)));
-    let assembly = assembly_steps(&analysis, &part_files, &asm_file, &eo);
+    let (assembly, limits) = assembly_plan(&analysis, &part_files, &asm_file, &eo);
     analysis.notes.extend(assembly.notes.iter().cloned());
-    let plan = BuildPlan { parts, assembly, part_defs };
+    let run_limits = a.limits && limits.is_some();
+    let plan = BuildPlan { parts, assembly, limits, run_limits, part_defs };
     std::fs::write(out.join("build-steps.json"), plan.to_json().to_pretty()).map_err(|e| e.to_string())?;
     eprintln!(
         "analysed {} in {:.1}s: {} parts, {} sheet metal, {} joints, {} constraints, {} patterns",
@@ -391,8 +406,16 @@ fn convert(a: &Args, input: &Path) -> Result<bool, String> {
     let mut probe_report = Vec::new();
     let mut events = Vec::new();
     if !a.dry_run {
-        let designs: Vec<&DesignSteps> = plan.parts.iter().chain(std::iter::once(&plan.assembly)).collect();
+        let mut designs: Vec<&DesignSteps> = plan.parts.iter().chain(std::iter::once(&plan.assembly)).collect();
+        if run_limits {
+            designs.extend(plan.limits.iter());
+        }
+        // A new build: what an earlier limits stage found in this folder is for another design.
+        let _ = std::fs::remove_file(out.join(LIMITS_RECORD));
         (runs, probe_report, events) = build(a, &out, &out, &designs, true)?;
+        if let Some(asm) = runs.iter().find(|r| r.name == plan.assembly.name) {
+            write_ids(&out, asm)?;
+        }
     }
     let md = report::markdown(&analysis, &runs, &probe_report, &events);
     std::fs::write(out.join("conversion-report.md"), &md).map_err(|e| e.to_string())?;
@@ -405,6 +428,53 @@ fn convert(a: &Args, input: &Path) -> Result<bool, String> {
     let ok = runs.iter().all(|r| r.saved);
     eprintln!("{} → {}", if ok { "done" } else { "finished with problems" }, asm_file);
     Ok(ok)
+}
+
+/// The ids the assembly's build bound (`assembly-ids.json`), for `inv2sc limits` later.
+fn write_ids(out: &Path, asm: &DesignResult) -> Result<(), String> {
+    let mut ids = Json::obj();
+    for (k, v) in &asm.vars {
+        if k != lcw_solidcraft::steps::STEPS_DIR {
+            ids.set(k, v.clone());
+        }
+    }
+    let j = lcw_json::obj! {"schema" => "lcw-assembly-ids/1", "assembly" => asm.file.as_str(), "saved" => asm.saved, "ids" => ids};
+    std::fs::write(out.join(IDS_FILE), j.to_pretty()).map_err(|e| e.to_string())
+}
+
+const IDS_FILE: &str = "assembly-ids.json";
+
+/// Find the travel limits of a built assembly's joints: the limits stage of its build steps,
+/// with the ids its build bound.
+fn limits(a: &Args, built: &Path) -> Result<bool, String> {
+    let steps_file = built.join("build-steps.json");
+    let text = std::fs::read_to_string(&steps_file).map_err(|e| format!("{}: {e}", steps_file.display()))?;
+    let plan = Json::parse(&text).map_err(|e| format!("{}: {e}", steps_file.display()))?;
+    let Some(stage) = limits_from_json(&plan)? else {
+        eprintln!("the assembly has no joint whose travel can be searched (build-steps.json has no limits stage)");
+        return Ok(true);
+    };
+    let ids_text = std::fs::read_to_string(built.join(IDS_FILE)).map_err(|e| format!("{}: {e} (the ids a build bound; written by convert from this version on)", built.join(IDS_FILE).display()))?;
+    let ids = Json::parse(&ids_text).map_err(|e| e.to_string())?;
+    if ids.bool_of("saved") == Some(false) {
+        return Err("the assembly's build did not save it, so there is nothing to search".into());
+    }
+    let preset: BTreeMap<String, Json> = ids.get("ids").and_then(Json::as_object).unwrap_or(&[]).iter().cloned().collect();
+    if a.redo {
+        let _ = std::fs::remove_file(built.join(LIMITS_RECORD));
+    }
+    let out = a.out.clone().unwrap_or_else(|| built.to_path_buf());
+    std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let (runs, probe_report, events) = build_with(a, &out, built, &[&stage], false, preset)?;
+    let mut md = format!("# Joint limits of {}\n\n", stage.file);
+    for p in &probe_report {
+        md.push_str(&format!("- profile: {p}\n"));
+    }
+    md.push_str(&report::limits_section(&runs));
+    md.push_str(&report::build_section(&runs, &events));
+    std::fs::write(out.join("limits-report.md"), md).map_err(|e| e.to_string())?;
+    eprintln!("report: {}", out.join("limits-report.md").display());
+    Ok(runs.iter().all(|r| r.saved))
 }
 
 fn analyze_only(a: &Args, input: &Path) -> Result<bool, String> {
@@ -573,6 +643,7 @@ fn clone_args(a: &Args) -> Args {
         tol_deg: a.tol_deg,
         clash_budget: a.clash_budget,
         no_clash: a.no_clash,
+        redo: a.redo,
     }
 }
 
@@ -590,6 +661,7 @@ fn main() -> ExitCode {
         "analyze" | "analyse" => need_input().and_then(|i| analyze_only(&args, &i)),
         "watch" => need_input().and_then(|i| watch(&args, &i)),
         "run" => need_input().and_then(|i| run_steps(&args, &i)),
+        "limits" => need_input().and_then(|i| limits(&args, &i)),
         "probe" => probe(&args),
         "verify" => need_input().and_then(|i| verify(&args, &i)),
         "version" | "--version" => {

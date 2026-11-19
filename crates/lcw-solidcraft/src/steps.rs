@@ -229,12 +229,15 @@ pub struct DesignSteps {
     pub steps: Vec<Step>,
     /// What was left out of this design and why, for the report.
     pub notes: Vec<String>,
+    /// It works on the design the one before it built (the limits stage on the assembly): the
+    /// ids that one bound stay bound.
+    pub continues: bool,
 }
 
 impl DesignSteps {
     pub fn from_json(j: &Json) -> Result<DesignSteps, String> {
         let steps = j.arr_of("steps").iter().map(Step::from_json).collect::<Result<Vec<_>, _>>()?;
-        Ok(DesignSteps { name: j.str_of("name").unwrap_or("design").to_string(), file: j.str_of("file").unwrap_or_default().to_string(), steps, notes: Vec::new() })
+        Ok(DesignSteps { name: j.str_of("name").unwrap_or("design").to_string(), file: j.str_of("file").unwrap_or_default().to_string(), steps, notes: Vec::new(), continues: j.bool_of("continues").unwrap_or(false) })
     }
 }
 
@@ -248,7 +251,17 @@ pub fn designs_from_json(j: &Json) -> Result<Vec<DesignSteps>, String> {
     if let Some(a) = j.get("assembly").filter(|a| !a.is_null()) {
         out.push(DesignSteps::from_json(a)?);
     }
+    if j.bool_of("run_limits") == Some(true) {
+        if let Some(l) = limits_from_json(j)? {
+            out.push(l);
+        }
+    }
     Ok(out)
+}
+
+/// The limits stage of a `build-steps.json`, when it has one.
+pub fn limits_from_json(j: &Json) -> Result<Option<DesignSteps>, String> {
+    j.get("limits").filter(|a| !a.is_null()).map(DesignSteps::from_json).transpose()
 }
 
 #[cfg(test)]

@@ -17,7 +17,8 @@
     "rigid_group":       {"command": "joint.rigid_group",          "params": {"occurrences": "occurrences"}},
     "joint":             {"command": "joint.create",               "params": {"type": "type", "a": "a", "b": "b", "flip": "flip", "name": "name", "limits": "limits", "quiet": "quiet"}},
     "constraint":        {"command": "assembly.constraint.create", "params": {"type": "type", "a": "a", "b": "b", "offset": "offset", "angle": "angle", "flip": "flip", "name": "name", "quiet": "quiet"}},
-    "find_limits":       {"command": "joint.find_limits",          "params": {"joint": "joint"}, "timeout_s": 900},
+    "find_limits":       {"command": "joint.find_limits",          "params": {"joint": "joint", "index": "index", "step": "step", "refine": "refine", "occurrences": "occurrences", "against": "against", "exclude_pairs": "exclude_pairs"}, "timeout_s": 900},
+    "sweep":             {"command": "joint.sweep",                "params": {"joint": "joint", "index": "index", "from": "from", "to": "to", "step": "step", "refine": "refine", "occurrences": "occurrences", "against": "against", "exclude_pairs": "exclude_pairs", "budget_s": "budget_s", "apply": "apply"}, "timeout_s": 300},
     "set_limits":        {"command": "joint.limits",               "params": {"joint": "joint", "index": "index", "min": "min", "max": "max"}},
     "parameter":         {"command": "parameters.change",          "params": {"name": "name", "expression": "expression", "comment": "comment"}},
     "list_bodies":       {"command": "inspect.measure",            "params": {"names_only": "names_only"}},
@@ -67,6 +68,13 @@
     "guard": {"about": "A step with a guard (constraints and joints) is undone with the `undo` op when it moves a guarded placement: `occurrence_props` before and after, compared by these pointers within tol_mm.",
               "points": ["/total/center_of_mass", "/total/bbox/min", "/total/bbox/max"], "tol_mm": 0.01},
     "drive": {"moved": "/moved", "reason": "/reason", "values": "/values", "stopped_by_loop": "/stopped_by_loop", "stopped_by_contact": "/stopped_by_contact", "conflicts": "/conflicts"}
+  },
+  "limits": {
+    "about": "The limits stage (`joint_limits`, a runner step): each joint value swept with the `sweep` op from where it is, a turn (or the parts' reach) each way, against the parts it can meet, with a time budget each way; a limit is set with `set_limits` only where both ways end at a contact. Pointers and values in the `sweep` op's reply.",
+    "stopped_at": "/stopped_at", "stopped_by": "/stopped_by", "ran_out": "/budget_ran_out",
+    "contact_a": "a", "contact_b": "b", "contact_at": "at", "touching_parts": "/touching_parts", "path_ids": "path_ids",
+    "loop": "loop", "limit": "limit", "budget": "budget",
+    "slack_s": 120
   },
   "fallbacks": {
     "rigid_group": ["joint"]

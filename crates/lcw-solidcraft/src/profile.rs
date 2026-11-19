@@ -52,6 +52,8 @@ pub struct Profile {
     /// to drive each joint.
     pub mechanism: Json,
     pub verify: Json,
+    /// How the limits stage (`joint_limits`) reads the `sweep` op's answers (`limits`).
+    pub limits: Json,
 }
 
 /// The `runner` section: timeouts, the `batch` tool and the answer of a call still running.
@@ -145,7 +147,7 @@ impl RunnerProfile {
 impl Profile {
     pub fn builtin() -> Profile {
         // The built-in profile is checked by a test; a broken one cannot ship.
-        Profile::parse(BUILTIN).unwrap_or_else(|_| Profile { ops: BTreeMap::new(), fallbacks: BTreeMap::new(), tested_with: Vec::new(), disabled: BTreeMap::new(), runner: RunnerProfile::default(), verify: Json::Null, mechanism: Json::Null })
+        Profile::parse(BUILTIN).unwrap_or_else(|_| Profile { ops: BTreeMap::new(), fallbacks: BTreeMap::new(), tested_with: Vec::new(), disabled: BTreeMap::new(), runner: RunnerProfile::default(), verify: Json::Null, mechanism: Json::Null, limits: Json::Null })
     }
 
     pub fn parse(text: &str) -> Result<Profile, String> {
@@ -180,7 +182,8 @@ impl Profile {
         let runner = RunnerProfile::parse(j.get("runner"))?;
         let verify = j.get("verify").cloned().unwrap_or(Json::Null);
         let mechanism = j.get("mechanism").cloned().unwrap_or(Json::Null);
-        Ok(Profile { ops, fallbacks, tested_with, disabled: BTreeMap::new(), runner, verify, mechanism })
+        let limits = j.get("limits").cloned().unwrap_or(Json::Null);
+        Ok(Profile { ops, fallbacks, tested_with, disabled: BTreeMap::new(), runner, verify, mechanism, limits })
     }
 
     /// How long one call of `op` (or, without an op, of the session tool `tool`) may take:
