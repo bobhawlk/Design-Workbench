@@ -446,6 +446,7 @@ impl<'a> Runner<'a> {
         // A step that must keep the volume (a sheet metal conversion that dropped a flange, or
         // was cut open where it should not be) is undone: the part stays the solid it was.
         if let Some(v0) = volume_before {
+            let command = self.last_command.clone();
             let v1 = match self.volume_now() {
                 Ok(v) => v,
                 Err(o) => return o,
@@ -469,6 +470,7 @@ impl<'a> Runner<'a> {
                         _ => String::new(),
                     };
                     let why = format!("it changed the part's volume by {:.1}% ({} to {} mm3){how}", rel * 100.0, fmt3(v0), fmt3(v1));
+                    self.last_command = command;
                     return Outcome::of(Status::Failed(if undone { format!("{why}, so it was undone and the part stays a solid") } else { format!("{why}, and undoing it did not restore the volume") }));
                 }
             }

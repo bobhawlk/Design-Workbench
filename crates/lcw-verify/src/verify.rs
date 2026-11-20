@@ -579,11 +579,14 @@ fn check_parts(bundle: &Bundle, part_docs: &[&Document], parts: &BTreeMap<String
             Some(c) => {
                 let why = match c {
                     Cause::Converter => "the built design is not what SolidCraft makes of its STEP".to_string(),
-                    Cause::SheetMetal => format!("rebuilt as sheet metal at {} mm: within {:.0}% of the volume and the thickness of the import", d.sheet_metal.as_ref().map_or(0.0, |s| s.thickness), SHEET_VOLUME_REL * 100.0),
-                    Cause::Import => format!("SolidCraft's own import of the STEP leaves {import_open} of {} body(ies) open (faces it could not build), so it has no volume; the design is that import", p.reference.geo.as_ref().map_or(0, |g| g.bodies)),
+                    Cause::SheetMetal => format!("rebuilt as sheet metal at {} mm: within {:.0}% of the volume and the thickness of the import", fmt(d.sheet_metal.as_ref().map_or(0.0, |s| s.thickness)), SHEET_VOLUME_REL * 100.0),
+                    Cause::Import => format!("SolidCraft's own import of the STEP leaves {import_open} of {} body(ies) open (faces it could not build), and an open body has no volume; the built design is that import, so this is not the converter's doing", p.reference.geo.as_ref().map_or(0, |g| g.bodies)),
                     Cause::Bodies => format!("Inventor counts {bodies} body(ies), {hidden} hidden (the STEP holds the visible ones)"),
                     Cause::RangeBox => "the volume matches Inventor's; its range box is larger than the part (not tight on curved faces)".to_string(),
-                    Cause::Export => "the design matches its STEP, but the STEP does not match Inventor's figures".to_string(),
+                    Cause::Export => format!(
+                        "the design matches its STEP, but the STEP does not match Inventor's figures{}",
+                        if d.mass.bodies.is_none() { " (this export does not say how many bodies the part has or how many are hidden: a hidden body, which is not in the STEP, would explain a smaller volume)" } else { "" }
+                    ),
                 };
                 let e = by_cause.entry(c.name()).or_insert((0, c.fails()));
                 e.0 += 1;

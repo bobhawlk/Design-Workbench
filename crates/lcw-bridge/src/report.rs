@@ -89,7 +89,10 @@ pub fn markdown(a: &Analysis, runs: &[DesignResult], probe: &[String], events: &
         if runs.is_empty() {
             s.push_str(&format!("| {} | {} | {} | {} |\n", cell(&def.name), count, cell(&planned), cell(&notes)));
         } else {
-            let built = built_as(by_name.get(def.name.as_str()).copied(), a.sheets.contains_key(d));
+            // Two part files may share a name; each design is saved as its own key.
+            let stem = |f: &str| f.rsplit(['/', '\\']).next().and_then(|n| n.strip_suffix(".sc")).unwrap_or_default().to_string();
+            let run = runs.iter().find(|r| stem(&r.file) == def.key).or_else(|| by_name.get(def.name.as_str()).copied());
+            let built = built_as(run, a.sheets.contains_key(d));
             s.push_str(&format!("| {} | {} | {} | {} | {} |\n", cell(&def.name), count, cell(&planned), cell(&built), cell(&notes)));
         }
     }
